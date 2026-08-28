@@ -76,3 +76,7 @@ Custom Harnesses keep the five arcs. They do not become a generic DAG builder, h
 Plugin RPC is not a tenant security boundary: the plugin runs in-process with the local user. Plan RPCs require the owning parent thread from `threads.get` so a stale UI or child thread cannot mutate another project by accident.
 
 Child token totals come from BB `thread/tokenUsage/updated` when present; missing usage stays null and no cost is invented. Inherited child routing uses `threads.defaultExecutionOptions` when BB provides it; otherwise provider/model stay null with source `inherited-unknown`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
