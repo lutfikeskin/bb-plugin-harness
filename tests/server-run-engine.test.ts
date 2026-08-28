@@ -63,8 +63,14 @@ async function loadPlugin(options?: {
       threads: {
         get: async ({ threadId }: { threadId: string }) => {
           const thread = threads.get(threadId);
-          if (!thread) throw new Error(`missing thread ${threadId}`);
-          return thread;
+          if (thread) return thread;
+          const created = makeThreadResponse({
+            id: threadId,
+            projectId: PROJECT,
+            environmentId: ENV,
+          });
+          threads.set(threadId, created);
+          return created;
         },
         spawn: async (args: Record<string, unknown>) => {
           if (options?.failSpawn) throw new Error("spawn failed");
@@ -110,8 +116,14 @@ describe("backend run engine", () => {
 
   it("keeps an ordinary thread inactive after creation and status read", async () => {
     host = await loadPlugin();
+    const created = makeThreadResponse({
+      id: "thr_new",
+      projectId: PROJECT,
+      environmentId: ENV,
+    });
+    host.threads.set("thr_new", created);
     await host.harness.behavior.emitThreadEvent("thread.created", {
-      thread: makeThreadResponse({ id: "thr_new", projectId: PROJECT, environmentId: ENV }),
+      thread: created,
     });
     const status = (await host.harness.behavior.callRpc("getStatus", {
       threadId: "thr_new",
@@ -648,6 +660,14 @@ describe("backend run engine", () => {
 
   it("keeps legacy rows readable and migrations repeatable", async () => {
     host = await loadPlugin();
+    host.threads.set(
+      "thr_legacy",
+      makeThreadResponse({
+        id: "thr_legacy",
+        projectId: PROJECT,
+        environmentId: ENV,
+      }),
+    );
     const db = host.bb.storage.database();
     db.prepare(
       `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at) VALUES (?, ?, ?, ?, ?)`,

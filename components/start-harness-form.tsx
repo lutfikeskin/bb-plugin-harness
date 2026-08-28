@@ -51,6 +51,7 @@ export function StartHarnessForm({
   const [specialistQuestion, setSpecialistQuestion] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [editor, setEditor] = useState<"create" | "edit" | null>(null);
+  const [mutationError, setMutationError] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("Custom Harness");
   const [draftDescription, setDraftDescription] = useState("");
   const [draftPhases, setDraftPhases] = useState(builtinHarnesses()[0]!.phases);
@@ -94,23 +95,28 @@ export function StartHarnessForm({
   };
 
   const saveDraft = async () => {
-    if (editor === "create") {
-      const result = await rpc.call("createHarness", {
-        name: draftName,
-        description: draftDescription,
-        phases: draftPhases,
-      });
-      setHarnessId(result.harness.id);
-    } else if (editor === "edit" && selected.kind === "custom") {
-      await rpc.call("updateHarness", {
-        id: selected.id,
-        name: draftName,
-        description: draftDescription,
-        phases: draftPhases,
-      });
+    setMutationError(null);
+    try {
+      if (editor === "create") {
+        const result = await rpc.call("createHarness", {
+          name: draftName,
+          description: draftDescription,
+          phases: draftPhases,
+        });
+        setHarnessId(result.harness.id);
+      } else if (editor === "edit" && selected.kind === "custom") {
+        await rpc.call("updateHarness", {
+          id: selected.id,
+          name: draftName,
+          description: draftDescription,
+          phases: draftPhases,
+        });
+      }
+      setEditor(null);
+      onRefresh();
+    } catch (cause) {
+      setMutationError(cause instanceof Error ? cause.message : String(cause));
     }
-    setEditor(null);
-    onRefresh();
   };
 
   return (
@@ -162,10 +168,18 @@ export function StartHarnessForm({
                 size="sm"
                 variant="ghost"
                 onClick={() => {
-                  void rpc.call("deleteHarness", { id: selected.id }).then(() => {
-                    setHarnessId(STANDARD_HARNESS_ID);
-                    onRefresh();
-                  });
+                  setMutationError(null);
+                  void rpc.call("deleteHarness", { id: selected.id }).then(
+                    () => {
+                      setHarnessId(STANDARD_HARNESS_ID);
+                      onRefresh();
+                    },
+                    (cause: unknown) => {
+                      setMutationError(
+                        cause instanceof Error ? cause.message : String(cause),
+                      );
+                    },
+                  );
                 }}
               >
                 Delete
@@ -281,6 +295,11 @@ export function StartHarnessForm({
             </div>
           ) : null}
         </>
+      ) : null}
+      {mutationError ? (
+        <p role="alert" className="text-sm text-destructive">
+          {mutationError}
+        </p>
       ) : null}
       <Button type="submit" disabled={!canStart}>
         Start Harness

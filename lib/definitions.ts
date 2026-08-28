@@ -9,6 +9,8 @@ import { MILESTONE_PIPELINE_ID } from "./run-engine";
 
 export const STANDARD_HARNESS_ID = "standard";
 export const CUSTOM_HARNESSES_KEY = "custom-harnesses";
+export const MAX_CUSTOM_HARNESSES = 32;
+export const MAX_CUSTOM_HARNESSES_BYTES = 200_000;
 
 export const HARNESS_ENGINES = ["manual", "milestone"] as const;
 export type HarnessEngine = (typeof HARNESS_ENGINES)[number];
@@ -121,9 +123,9 @@ function parsePhaseSpecs(value: unknown): Record<Phase, PhaseSpec> | null {
     if (!spec || typeof spec !== "object") return null;
     const item = spec as Record<string, unknown>;
     if (typeof item.title !== "string" || typeof item.detail !== "string") return null;
-    const title = item.title.trim();
-    const detail = item.detail.trim();
-    if (title.length < 1 || title.length > 200) return null;
+    const title = item.title.trim() || DEFAULT_PHASE_SPECS[phase].title;
+    const detail = item.detail.trim() || DEFAULT_PHASE_SPECS[phase].detail;
+    if (title.length > 200) return null;
     if (detail.length > 4000) return null;
     phases[phase] = { title, detail };
   }
@@ -175,6 +177,17 @@ export function parseCustomHarnesses(value: unknown): HarnessDefinition[] {
   return out;
 }
 
+/** Empty title or instructions (after trim) fall back to Standard Harness copy for that field. */
+export function assertCustomCatalogFits(list: readonly HarnessDefinition[]): void {
+  if (list.length > MAX_CUSTOM_HARNESSES) {
+    throw new Error(`At most ${MAX_CUSTOM_HARNESSES} custom Harnesses can be saved.`);
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(list)).length;
+  if (bytes > MAX_CUSTOM_HARNESSES_BYTES) {
+    throw new Error("Custom Harness catalog exceeds the storage ceiling.");
+  }
+}
+
 export type HarnessDraft = {
   id?: string;
   name: string;
@@ -200,11 +213,8 @@ export function validateHarnessDraft(draft: HarnessDraft): string | null {
     for (const phase of PHASES) {
       const spec = draft.phases[phase];
       if (!spec) continue;
-      if (spec.title !== undefined) {
-        const title = spec.title.trim();
-        if (title.length < 1 || title.length > 200) {
-          return `${phase} title must be 1–200 characters.`;
-        }
+      if (spec.title !== undefined && spec.title.trim().length > 200) {
+        return `${phase} title must be at most 200 characters.`;
       }
       if (spec.detail !== undefined && spec.detail.trim().length > 4000) {
         return `${phase} instructions must be at most 4000 characters.`;

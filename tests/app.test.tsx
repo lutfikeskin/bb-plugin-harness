@@ -505,6 +505,27 @@ describe("Harness UI activation", () => {
     slot.lifecycle.unmount();
   });
 
+  it("surfaces custom Harness mutation errors", async () => {
+    const slot = renderSlot(
+      app.threadPanelActions[0]!,
+      { threadId: "thr_1", params: null },
+      {
+        rpc: {
+          getStatus: () => emptyStatus(),
+          createHarness: () => {
+            throw new Error("At most 32 custom Harnesses can be saved.");
+          },
+        },
+        context: { projectId: "proj_1", threadId: "thr_1" },
+      },
+    );
+    await slot.findByText("Create Harness");
+    fireEvent.click(slot.getByRole("button", { name: "Create Harness" }));
+    fireEvent.click(slot.getByRole("button", { name: "Save Harness" }));
+    expect((await slot.findByRole("alert")).textContent).toMatch(/at most 32/i);
+    slot.lifecycle.unmount();
+  });
+
   it("renders manual arc controls, DAG Start/Done, and Add Worker", async () => {
     const planId = "plan_std";
     const status: HarnessStatusDto = {

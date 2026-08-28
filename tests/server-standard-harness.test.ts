@@ -12,7 +12,8 @@ const PROJECT = "proj_test";
 const PARENT = "thr_parent";
 const ENV = "env_parent";
 
-async function loadPlugin() {
+async function loadPlugin(options?: { allowSpawn?: boolean }) {
+  let childSeq = 0;
   const threads = new Map([
     [
       PARENT,
@@ -33,9 +34,21 @@ async function loadPlugin() {
           if (!thread) throw new Error(`missing thread ${threadId}`);
           return thread;
         },
-        spawn: async () => {
-          throw new Error("standard start must not spawn a child");
+        spawn: async (args: Record<string, unknown>) => {
+          if (!options?.allowSpawn) {
+            throw new Error("standard start must not spawn a child");
+          }
+          childSeq += 1;
+          const child = makeThreadResponse({
+            id: `thr_child_${childSeq}`,
+            projectId: PROJECT,
+            environmentId: ENV,
+            parentThreadId: String(args.parentThreadId),
+          });
+          threads.set(child.id, child);
+          return child;
         },
+        stop: async ({ threadId }: { threadId: string }) => threads.get(threadId),
       },
     },
   });
@@ -180,5 +193,145 @@ describe("standard and custom harnesses", () => {
         id: MILESTONE_PIPELINE_ID,
       }),
     ).rejects.toThrow(/immutable/i);
+  });
+
+  it("hides a completed Milestone run after Standard starts on the same thread", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Milestone first",
+      harnessId: MILESTONE_PIPELINE_ID,
+    });
+    await host.harness.behavior.callRpc("stopRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    const next = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Standard after Milestone",
+    })) as {
+      run: { status: string } | null;
+      harness: { id: string; engine: string } | null;
+      plan: { nodes: Array<{ phase: string }> } | null;
+    };
+    expect(next.run).toBeNull();
+    expect(next.harness).toMatchObject({
+      id: STANDARD_HARNESS_ID,
+      engine: "manual",
+    });
+    expect(next.plan?.nodes.map((node) => node.phase)).toContain("explore");
+  });
+
+  it("namespaces added node ids globally and resolves phase aliases", async () => {
+    host = await loadPlugin();
+    const first = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "One",
+    })) as { plan: { id: string; nodes: Array<{ id: string; status: string }> } };
+    const other = makeThreadResponse({
+      id: "thr_two",
+      projectId: PROJECT,
+      environmentId: ENV,
+    });
+    host.threads.set("thr_two", other);
+    const second = (await host.harness.behavior.callRpc("startRun", {
+      threadId: "thr_two",
+      projectId: PROJECT,
+      objective: "Two",
+    })) as { plan: { id: string } };
+    const added = (await host.harness.behavior.callRpc("addNode", {
+      planId: first.plan.id,
+      title: "Extra worker",
+      phase: "worker",
+      deps: ["plan"],
+    })) as { plan: { nodes: Array<{ id: string; deps: string[] }> } };
+    const extra = added.plan.nodes.find((node) => node.id.includes("extra-worker"));
+    expect(extra?.id.startsWith(`${first.plan.id}-`)).toBe(true);
+    expect(extra?.deps).toEqual([`${first.plan.id}-plan`]);
+    await expect(
+      host.harness.behavior.callRpc("addNode", {
+        planId: second.plan.id,
+        title: "Broken",
+        deps: ["missing-node"],
+      }),
+    ).rejects.toThrow(/unknown dependency/i);
+    await host.harness.behavior.callRpc("startNode", {
+      planId: first.plan.id,
+      nodeId: "explore",
+      threadId: PARENT,
+    });
+    const after = (await host.harness.behavior.callRpc("getPlan", {
+      id: first.plan.id,
+    })) as { plan: { nodes: Array<{ id: string; status: string }> } };
+    expect(
+      after.plan.nodes.find((node) => node.id === `${first.plan.id}-explore`)?.status,
+    ).toBe("in_progress");
+    await host.harness.behavior.callRpc("completeNode", {
+      planId: first.plan.id,
+      nodeId: "explore",
+    });
+    await expect(
+      host.harness.behavior.callRpc("completeNode", {
+        planId: first.plan.id,
+        nodeId: "plan",
+      }),
+    ).rejects.toThrow(/in progress/i);
+  });
+
+  it("reopens the last Worker when Critic rewinds", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const started = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Rewind path",
+    })) as { plan: { id: string; nodes: Array<{ id: string; phase: string }> } };
+    const planId = started.plan.id;
+    for (const alias of ["explore", "plan", "worker"]) {
+      await host.harness.behavior.callRpc("startNode", {
+        planId,
+        nodeId: alias,
+        threadId: PARENT,
+      });
+      await host.harness.behavior.callRpc("completeNode", {
+        planId,
+        nodeId: alias,
+      });
+    }
+    await host.harness.behavior.callRpc("setPhase", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      phase: "critic",
+    });
+    await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "critic",
+      threadId: PARENT,
+    });
+    const rewound = (await host.harness.behavior.callRpc("rewind", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as {
+      arc: { phase: string };
+      plan: { nodes: Array<{ phase: string; status: string; childThreadId: string | null }> };
+    };
+    expect(rewound.arc.phase).toBe("worker");
+    const worker = rewound.plan.nodes.find((node) => node.phase === "worker");
+    const critic = rewound.plan.nodes.find((node) => node.phase === "critic");
+    expect(worker?.status).toBe("pending");
+    expect(worker?.childThreadId).toBeNull();
+    expect(critic?.status).toBe("pending");
+  });
+
+  it("rejects a caller projectId that does not match the thread", async () => {
+    host = await loadPlugin();
+    await expect(
+      host.harness.behavior.callRpc("getStatus", {
+        threadId: PARENT,
+        projectId: "proj_other",
+      }),
+    ).rejects.toThrow(/does not match/);
   });
 });

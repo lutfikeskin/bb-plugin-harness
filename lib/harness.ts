@@ -185,17 +185,18 @@ export function parseExecutionChoice(value: unknown): ExecutionChoice | null {
   const record = value as Record<string, unknown>;
   if (
     typeof record.providerId !== "string" ||
-    record.providerId.length === 0 ||
     typeof record.model !== "string" ||
-    record.model.length === 0 ||
     typeof record.reasoningLevel !== "string" ||
     !isReasoningLevel(record.reasoningLevel)
   ) {
     return null;
   }
+  const providerId = record.providerId.trim();
+  const model = record.model.trim();
+  if (providerId.length === 0 || model.length === 0) return null;
   const choice: ExecutionChoice = {
-    providerId: record.providerId,
-    model: record.model,
+    providerId,
+    model,
     reasoningLevel: record.reasoningLevel,
   };
   if (record.serviceTier === "default" || record.serviceTier === "fast") {
@@ -303,6 +304,79 @@ export function workerOrdinal(nodes: readonly PlanNode[], nodeId: string): numbe
     .filter((node) => node.phase === "worker")
     .sort((a, b) => a.sortOrder - b.sortOrder);
   return workers.findIndex((node) => node.id === nodeId);
+}
+
+export function routingChoiceForPlanNode(
+  nodes: readonly PlanNode[],
+  node: PlanNode,
+  routing: RoleRouting,
+): ExecutionChoice | null {
+  const override = nodeChoice(node);
+  if (override) return override;
+  const ordinal = workerOrdinal(nodes, node.id);
+  return routing[routingSlotFor(node.phase, ordinal >= 0 ? ordinal : 0)];
+}
+
+/** Exact id wins; otherwise a bare phase name aliases the seeded `{planId}-{phase}` node. */
+export function resolveNodeRef(
+  nodes: readonly Pick<PlanNode, "id" | "phase" | "sortOrder">[],
+  requested: string,
+  planId: string,
+): string {
+  if (nodes.some((node) => node.id === requested)) return requested;
+  if (isPhase(requested)) {
+    const seeded = seedNodeId(planId, requested);
+    if (nodes.some((node) => node.id === seeded)) return seeded;
+    const match = nodes
+      .filter((node) => node.phase === requested)
+      .sort((a, b) => a.sortOrder - b.sortOrder)[0];
+    if (match) return match.id;
+  }
+  return requested;
+}
+
+export function resolveDependencyIds(
+  nodes: readonly Pick<PlanNode, "id" | "phase" | "sortOrder">[],
+  deps: readonly string[],
+  planId: string,
+): string[] {
+  return deps.map((dep) => {
+    const resolved = resolveNodeRef(nodes, dep, planId);
+    if (!nodes.some((node) => node.id === resolved)) {
+      throw new Error(`Unknown dependency ${dep}`);
+    }
+    return resolved;
+  });
+}
+
+export function assertNewNodeDeps(
+  nodes: readonly PlanNode[],
+  node: Pick<PlanNode, "id" | "title" | "detail" | "phase" | "status" | "sortOrder"> & {
+    deps: string[];
+  },
+): void {
+  const known = new Set(nodes.map((item) => item.id));
+  known.add(node.id);
+  const unknown = node.deps.filter((dep) => !known.has(dep));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown dependency ${unknown.join(", ")}`);
+  }
+  if (wouldCycle([...nodes, { ...node, deps: node.deps }], node.id, node.deps)) {
+    throw new Error("That dependency list would create a cycle.");
+  }
+}
+
+export function namespacedNodeId(
+  planId: string,
+  title: string,
+  taken: ReadonlySet<string>,
+  unique: () => string,
+): string {
+  const base = `${planId}-${slugId(title)}`;
+  if (!taken.has(base)) return base;
+  let id = `${base}-${unique()}`;
+  while (taken.has(id)) id = `${base}-${unique()}`;
+  return id;
 }
 
 export type PhaseSpec = {

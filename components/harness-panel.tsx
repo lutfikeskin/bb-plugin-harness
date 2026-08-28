@@ -12,6 +12,7 @@ import {
   PHASE_COPY,
   formatChoice,
   isSpawnablePhase,
+  routingChoiceForPlanNode,
   routingSlotFor,
   type ExecutionChoice,
   type Phase,
@@ -455,6 +456,7 @@ function ManualHarnessView({
   onStop,
   onStartNode,
   onCompleteNode,
+  onReopenWorker,
   onAddWorker,
   onSetRouting,
 }: {
@@ -465,6 +467,7 @@ function ManualHarnessView({
   onStop: () => void;
   onStartNode: (nodeId: string) => void;
   onCompleteNode: (nodeId: string) => void;
+  onReopenWorker: (nodeId: string) => void;
   onAddWorker: (title: string) => void;
   onSetRouting: (nodeId: string, choice: ExecutionChoice | null) => void;
 }) {
@@ -487,6 +490,22 @@ function ManualHarnessView({
         <Button size="sm" variant="outline" disabled={pending} onClick={onRewind}>
           Rewind
         </Button>
+        {phase === "critic"
+          ? (plan?.nodes ?? [])
+              .filter((node) => node.phase === "worker" && node.status === "done")
+              .slice(-1)
+              .map((node) => (
+                <Button
+                  key={node.id}
+                  size="sm"
+                  variant="outline"
+                  disabled={pending}
+                  onClick={() => onReopenWorker(node.id)}
+                >
+                  Reopen Worker
+                </Button>
+              ))
+          : null}
         <Button size="sm" variant="destructive" disabled={pending} onClick={onStop}>
           Stop
         </Button>
@@ -512,7 +531,7 @@ function ManualHarnessView({
                   <p className="truncate text-sm">{node.title}</p>
                   <p className="text-[11px] text-muted-foreground">
                     {node.phase} · {node.id} · {node.status}
-                    {` · ${formatChoice(persistedPlanChoice(node) ?? status.routing[routingSlotFor(node.phase, 0)])}`}
+                    {` · ${formatChoice(routingChoiceForPlanNode(plan?.nodes ?? [], node, status.routing))}`}
                   </p>
                   {node.child ? (
                     <p className="mt-1 text-[11px] text-muted-foreground">
@@ -728,6 +747,15 @@ export function HarnessPanel({
                   if (!status.plan) return;
                   void run(() =>
                     rpc.call("completeNode", {
+                      planId: status.plan!.id,
+                      nodeId,
+                    }),
+                  );
+                }}
+                onReopenWorker={(nodeId) => {
+                  if (!status.plan) return;
+                  void run(() =>
+                    rpc.call("reopenNode", {
                       planId: status.plan!.id,
                       nodeId,
                     }),

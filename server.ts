@@ -22,11 +22,13 @@ import {
   parseRoleRouting,
   previousPhase,
   recommendedTier,
+  resolveDependencyIds,
+  resolveNodeRef,
+  namespacedNodeId,
+  assertNewNodeDeps,
   routingSlotFor,
   seedArcNodes,
-  slugId,
   workerOrdinal,
-  wouldCycle,
   type ExecutionChoice,
   type NodeStatus,
   type Phase,
@@ -37,6 +39,7 @@ import {
   CUSTOM_HARNESSES_KEY,
   STANDARD_HARNESS_ID,
   applyHarnessPatch,
+  assertCustomCatalogFits,
   builtinHarnesses,
   cloneStandardHarness,
   isReservedHarnessId,
@@ -103,8 +106,8 @@ const arcSchema = z.object({
 
 const reasoningLevelSchema = z.enum(REASONING_LEVELS);
 const executionChoiceSchema = z.object({
-  providerId: z.string(),
-  model: z.string(),
+  providerId: z.string().trim().min(1),
+  model: z.string().trim().min(1),
   reasoningLevel: reasoningLevelSchema,
   serviceTier: z.enum(["default", "fast"]).optional(),
 });
@@ -405,6 +408,10 @@ export const rpcContract = defineRpcContract({
     output: z.object({ plan: planFullSchema }),
   },
   skipNode: {
+    input: z.object({ planId: z.string(), nodeId: z.string() }),
+    output: z.object({ plan: planFullSchema }),
+  },
+  reopenNode: {
     input: z.object({ planId: z.string(), nodeId: z.string() }),
     output: z.object({ plan: planFullSchema }),
   },
@@ -768,6 +775,12 @@ export default async function plugin(bb: BbPluginApi) {
      SET provider_id = ?, model = ?, reasoning_level = ?, service_tier = ?
      WHERE id = ? AND plan_id = ?`,
   );
+  const resetPlanNode = db.prepare(
+    `UPDATE plan_nodes
+     SET status = ?, child_thread_id = NULL
+     WHERE id = ? AND plan_id = ?`,
+  );
+  const selectAllNodeIds = db.prepare("SELECT id FROM plan_nodes");
 
   const selectRun = db.prepare("SELECT * FROM harness_runs WHERE id = ?");
   const selectLiveRun = db.prepare(
@@ -851,8 +864,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function saveCustomHarnesses(
     next: HarnessDefinition[],
   ): Promise<HarnessDefinition[]> {
-    customHarnesses = next;
+    assertCustomCatalogFits(next);
     await bb.storage.kv.set(CUSTOM_HARNESSES_KEY, next);
+    customHarnesses = next;
     publish();
     return next;
   }
@@ -1223,7 +1237,7 @@ export default async function plugin(bb: BbPluginApi) {
     definition: HarnessDefinition,
   ): Promise<void> {
     const parent = await bb.sdk.threads.get({ threadId: input.threadId });
-    const projectId = input.projectId ?? parent.projectId;
+    const projectId = await resolveProjectId(input.threadId, input.projectId);
     assertCanStart(input.threadId);
     const now = Date.now();
     const frozen = snapshotHarness(definition);
@@ -1263,7 +1277,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function startMilestoneRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
     const parent = await bb.sdk.threads.get({ threadId: input.threadId });
-    const projectId = input.projectId ?? parent.projectId;
+    const projectId = await resolveProjectId(input.threadId, input.projectId);
     assertCanStart(input.threadId);
     if (!parent.environmentId) {
       throw new Error("Parent thread has no environment; cannot start a Harness run.");
@@ -1644,10 +1658,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function resolveProjectId(
     threadId: string,
-    fallback?: string,
+    claimed?: string,
   ): Promise<string> {
-    if (fallback) return fallback;
     const thread = await bb.sdk.threads.get({ threadId });
+    if (claimed && claimed !== thread.projectId) {
+      throw new Error(
+        `projectId ${claimed} does not match thread ${threadId}.`,
+      );
+    }
     return thread.projectId;
   }
 
@@ -1722,8 +1740,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function statusPayload(threadId: string, projectId: string) {
     const ownerId = ownerThreadId(threadId);
-    const run = latestRunFor(ownerId);
+    const live = liveRunFor(ownerId);
     const existingArc = readArc(ownerId);
+    const run = live ?? (existingArc ? null : latestRunFor(ownerId));
     const phase = run
       ? phaseFromRun(run)
       : existingArc && isPhase(existingArc.phase)
@@ -1796,11 +1815,10 @@ export default async function plugin(bb: BbPluginApi) {
     parentThreadId?: string,
   ) {
     const plan = requirePlan(planId);
+    const node = lookupPlanNode(planId, nodeId);
     const nodes = nodesOf(planId);
-    const node = nodes.find((candidate) => candidate.id === nodeId);
-    if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
     const inflight = activeNode(nodes);
-    if (inflight && inflight.id !== nodeId) {
+    if (inflight && inflight.id !== node.id) {
       throw new Error(
         `Node ${inflight.id} is already in progress. Complete it before starting another.`,
       );
@@ -1810,16 +1828,16 @@ export default async function plugin(bb: BbPluginApi) {
       return parent && parent.status !== "done" && parent.status !== "skipped";
     });
     if (blocked.length > 0) {
-      throw new Error(`Node ${nodeId} is blocked by: ${blocked.join(", ")}`);
+      throw new Error(`Node ${node.id} is blocked by: ${blocked.join(", ")}`);
     }
     if (node.status === "done" || node.status === "skipped") {
-      throw new Error(`Node ${nodeId} is ${node.status} and cannot start.`);
+      throw new Error(`Node ${node.id} is ${node.status} and cannot start.`);
     }
     if (node.status === "in_progress" && node.childThreadId) {
       return { plan: await toFull(plan) };
     }
 
-    updateNodeStatus.run("in_progress", nodeId, planId);
+    updateNodeStatus.run("in_progress", node.id, planId);
     touchPlan.run(Date.now(), planId);
 
     if (!isSpawnablePhase(node.phase)) {
@@ -1829,12 +1847,12 @@ export default async function plugin(bb: BbPluginApi) {
 
     const parentId = plan.thread_id ?? parentThreadId;
     if (!parentId) {
-      updateNodeStatus.run("pending", nodeId, planId);
+      updateNodeStatus.run("pending", node.id, planId);
       throw new Error("Need a parent thread to spawn a worker/critic/promote child.");
     }
     const parent = await bb.sdk.threads.get({ threadId: parentId });
     if (!parent.environmentId) {
-      updateNodeStatus.run("pending", nodeId, planId);
+      updateNodeStatus.run("pending", node.id, planId);
       throw new Error("Parent thread has no environment; cannot spawn a child.");
     }
 
@@ -1868,9 +1886,9 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : {}),
       });
-      updateNodeChild.run(child.id, nodeId, planId);
+      updateNodeChild.run(child.id, node.id, planId);
     } catch (error) {
-      updateNodeStatus.run("pending", nodeId, planId);
+      updateNodeStatus.run("pending", node.id, planId);
       throw error;
     }
     publish();
@@ -1928,12 +1946,101 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function uniqueNodeId(planId: string, title: string): string {
-    const existing = new Set(nodesOf(planId).map((node) => node.id));
-    const base = slugId(title);
-    if (!existing.has(base)) return base;
-    let id = `${base}-${shortId()}`;
-    while (existing.has(id)) id = `${base}-${shortId()}`;
-    return id;
+    const taken = new Set(
+      (selectAllNodeIds.all() as Array<{ id: string }>).map((row) => row.id),
+    );
+    return namespacedNodeId(planId, title, taken, shortId);
+  }
+
+  function lookupPlanNode(planId: string, nodeId: string): PlanNode {
+    const nodes = nodesOf(planId);
+    const resolved = resolveNodeRef(nodes, nodeId, planId);
+    const node = nodes.find((candidate) => candidate.id === resolved);
+    if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
+    return node;
+  }
+
+  function addPlanNode(args: {
+    planId: string;
+    title: string;
+    detail?: string;
+    phase?: Phase;
+    deps?: string[];
+  }): void {
+    const planId = args.planId;
+    const nodes = nodesOf(planId);
+    const id = uniqueNodeId(planId, args.title);
+    const resolvedDeps = resolveDependencyIds(nodes, args.deps ?? [], planId);
+    const phase = args.phase ?? "worker";
+    const detail = args.detail ?? "";
+    assertNewNodeDeps(nodes, {
+      id,
+      title: args.title,
+      detail,
+      phase,
+      status: "pending",
+      deps: resolvedDeps,
+      sortOrder: nodes.length,
+    });
+    insertNode.run({
+      id,
+      plan_id: planId,
+      title: args.title,
+      detail,
+      phase,
+      status: "pending",
+      deps: JSON.stringify(resolvedDeps),
+      sort_order: nodes.length,
+    });
+    touchPlan.run(Date.now(), planId);
+  }
+
+  function completePlanNode(planId: string, nodeId: string): PlanNode {
+    const node = lookupPlanNode(planId, nodeId);
+    if (node.status !== "in_progress") {
+      throw new Error(`Node ${node.id} must be in progress to mark done.`);
+    }
+    updateNodeStatus.run("done", node.id, planId);
+    touchPlan.run(Date.now(), planId);
+    publish();
+    return node;
+  }
+
+  function skipPlanNode(planId: string, nodeId: string): PlanNode {
+    const node = lookupPlanNode(planId, nodeId);
+    updateNodeStatus.run("skipped", node.id, planId);
+    touchPlan.run(Date.now(), planId);
+    publish();
+    return node;
+  }
+
+  function reopenPlanNode(planId: string, nodeId: string): PlanNode {
+    const node = lookupPlanNode(planId, nodeId);
+    if (node.phase !== "worker") {
+      throw new Error("Only Worker nodes can be reopened after Critic.");
+    }
+    if (node.status !== "done") {
+      throw new Error(`Node ${node.id} must be done before it can be reopened.`);
+    }
+    resetPlanNode.run("pending", node.id, planId);
+    const critics = nodesOf(planId).filter(
+      (candidate) => candidate.phase === "critic" && candidate.status === "in_progress",
+    );
+    for (const critic of critics) {
+      resetPlanNode.run("pending", critic.id, planId);
+    }
+    touchPlan.run(Date.now(), planId);
+    publish();
+    return lookupPlanNode(planId, node.id);
+  }
+
+  function reopenLastWorker(planId: string): void {
+    const workers = nodesOf(planId)
+      .filter((node) => node.phase === "worker" && node.status === "done")
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    const last = workers[workers.length - 1];
+    if (!last) return;
+    reopenPlanNode(planId, last.id);
   }
 
   function formatStatus(status: Awaited<ReturnType<typeof statusPayload>>): string {
@@ -2113,9 +2220,14 @@ export default async function plugin(bb: BbPluginApi) {
       const prev = previousPhase(phase);
       if (!prev) throw new Error("Already at Explore.");
       writeArc(threadId, resolved, prev);
+      if (phase === "critic" && prev === "worker") {
+        const plan = planForThread(resolved, threadId);
+        if (plan) reopenLastWorker(plan.id);
+      }
       return statusPayload(threadId, resolved);
     },
-    listPlans: ({ projectId, threadId }) => {
+    listPlans: async ({ projectId, threadId }) => {
+      if (threadId) await resolveProjectId(threadId, projectId);
       const rows = (
         threadId
           ? (selectPlansForThread.all(projectId, threadId) as PlanRow[])
@@ -2128,10 +2240,13 @@ export default async function plugin(bb: BbPluginApi) {
       return { plan: row ? await toFull(row) : null };
     },
     createPlan: async ({ projectId, threadId, name, seedArc }) => {
+      const resolvedProject = threadId
+        ? await resolveProjectId(threadId, projectId)
+        : projectId;
       const now = Date.now();
       const row: PlanRow = {
         id: shortId(),
-        project_id: projectId,
+        project_id: resolvedProject,
         thread_id: threadId ?? null,
         name,
         created_at: now,
@@ -2149,31 +2264,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     addNode: async ({ planId, title, detail, phase, deps }) => {
       const plan = requirePlan(planId);
-      const nodes = nodesOf(planId);
-      const id = uniqueNodeId(planId, title);
-      const resolvedDeps = deps ?? [];
-      if (wouldCycle([...nodes, {
-        id,
-        title,
-        detail: detail ?? "",
-        phase: phase ?? "worker",
-        status: "pending",
-        deps: resolvedDeps,
-        sortOrder: nodes.length,
-      }], id, resolvedDeps)) {
-        throw new Error("That dependency list would create a cycle.");
-      }
-      insertNode.run({
-        id,
-        plan_id: planId,
-        title,
-        detail: detail ?? "",
-        phase: phase ?? "worker",
-        status: "pending",
-        deps: JSON.stringify(resolvedDeps),
-        sort_order: nodes.length,
-      });
-      touchPlan.run(Date.now(), planId);
+      addPlanNode({ planId, title, detail, phase, deps });
       publish();
       return { plan: await toFull(plan) };
     },
@@ -2187,14 +2278,13 @@ export default async function plugin(bb: BbPluginApi) {
     },
     setNodeRouting: async ({ planId, nodeId, choice }) => {
       const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
+      const node = lookupPlanNode(planId, nodeId);
       updateNodeChoice.run(
         choice?.providerId ?? null,
         choice?.model ?? null,
         choice?.reasoningLevel ?? null,
         choice?.serviceTier ?? null,
-        nodeId,
+        node.id,
         planId,
       );
       touchPlan.run(Date.now(), planId);
@@ -2208,20 +2298,17 @@ export default async function plugin(bb: BbPluginApi) {
     suggestChoice: async () => ({ choice: await firstAvailableChoice() }),
     completeNode: async ({ planId, nodeId }) => {
       const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
-      updateNodeStatus.run("done", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
+      completePlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
     skipNode: async ({ planId, nodeId }) => {
       const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
-      updateNodeStatus.run("skipped", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
+      skipPlanNode(planId, nodeId);
+      return { plan: await toFull(plan) };
+    },
+    reopenNode: async ({ planId, nodeId }) => {
+      const plan = requirePlan(planId);
+      reopenPlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
     initWorkspace: ({ threadId }) => initWorkspace(threadId),
@@ -2467,6 +2554,10 @@ export default async function plugin(bb: BbPluginApi) {
             const prev = previousPhase(phase);
             if (!prev) return fail("Already at Explore.");
             writeArc(threadId!, projectId, prev);
+            if (phase === "critic" && prev === "worker") {
+              const plan = planForThread(projectId, threadId!);
+              if (plan) reopenLastWorker(plan.id);
+            }
             const status = await statusPayload(threadId!, projectId);
             return reply(status, formatStatus(status));
           }
@@ -2574,26 +2665,15 @@ export default async function plugin(bb: BbPluginApi) {
                   .map((item) => item.trim())
                   .filter(Boolean);
                 const plan = requirePlan(planId);
-                const nodes = nodesOf(planId);
-                const id = uniqueNodeId(planId, title);
-                insertNode.run({
-                  id,
-                  plan_id: planId,
-                  title,
-                  detail: "",
-                  phase,
-                  status: "pending",
-                  deps: JSON.stringify(deps),
-                  sort_order: nodes.length,
-                });
-                touchPlan.run(Date.now(), planId);
+                addPlanNode({ planId, title, phase, deps });
                 publish();
                 const full = await toFull(plan);
                 return reply(full, formatPlan(full));
               }
               case "start":
               case "complete":
-              case "skip": {
+              case "skip":
+              case "reopen": {
                 const planId = rest[1];
                 const nodeId = rest[2];
                 if (!planId || !nodeId) {
@@ -2603,13 +2683,9 @@ export default async function plugin(bb: BbPluginApi) {
                   const started = await startPlanNode(planId, nodeId, threadId);
                   return reply(started.plan, formatPlan(started.plan));
                 }
-                updateNodeStatus.run(
-                  sub === "complete" ? "done" : "skipped",
-                  nodeId,
-                  planId,
-                );
-                touchPlan.run(Date.now(), planId);
-                publish();
+                if (sub === "complete") completePlanNode(planId, nodeId);
+                else if (sub === "skip") skipPlanNode(planId, nodeId);
+                else reopenPlanNode(planId, nodeId);
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
               }
@@ -2726,16 +2802,12 @@ export default async function plugin(bb: BbPluginApi) {
         persistPlanSnapshot(row.id, standardHarnessDefinition(now));
       }
       for (const node of nodes ?? []) {
-        const id = uniqueNodeId(row.id, node.title);
-        insertNode.run({
-          id,
-          plan_id: row.id,
+        addPlanNode({
+          planId: row.id,
           title: node.title,
-          detail: node.detail ?? "",
-          phase: node.phase ?? "worker",
-          status: "pending",
-          deps: JSON.stringify(node.deps ?? []),
-          sort_order: nodesOf(row.id).length,
+          detail: node.detail,
+          phase: node.phase,
+          deps: node.deps,
         });
       }
       publish();
@@ -2760,7 +2832,7 @@ export default async function plugin(bb: BbPluginApi) {
     async execute({ planId, nodeId }, ctx) {
       const nodes = nodesOf(planId);
       const target = nodeId
-        ? nodes.find((node) => node.id === nodeId)
+        ? lookupPlanNode(planId, nodeId)
         : nextWorkNode(nodes);
       if (!target) return "No remaining unblocked nodes.";
       try {
@@ -2791,12 +2863,10 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     async execute({ planId, nodeId }) {
       requirePlan(planId);
-      updateNodeStatus.run("done", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
+      const completed = completePlanNode(planId, nodeId);
       const plan = await toFull(requirePlan(planId));
       const next = nextWorkNode(plan.nodes);
-      return JSON.stringify({ completed: nodeId, next, plan }, null, 2);
+      return JSON.stringify({ completed: completed.id, next, plan }, null, 2);
     },
   });
 
