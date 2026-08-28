@@ -12,7 +12,7 @@
   },
   "bb": {
     "name": "Harness",
-    "description": "Opt-in five-phase coding harness: Explore → Plan → Worker → Critic → Promote. Explicit Start Harness, visible role children, per-role provider/model routing.",
+    "description": "Opt-in coding harness. Standard Harness is the immutable default (Explore → Plan → Worker → Critic → Promote). Create custom Harnesses from Standard.",
     "branding": {
       "icon": "./assets/icon.svg"
     },

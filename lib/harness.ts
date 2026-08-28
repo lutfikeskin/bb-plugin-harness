@@ -10,6 +10,7 @@ export type Phase = (typeof PHASES)[number];
 
 export const NODE_STATUSES = [
   "pending",
+  "starting",
   "in_progress",
   "done",
   "skipped",
@@ -35,28 +36,28 @@ export const ROUTING_SLOT_COPY: Record<
   { label: string; hint: string }
 > = {
   explore: {
-    label: "Scout / Specialist",
-    hint: "Explore-arc children. Scout maps the problem; Specialist answers one question. Unset inherits the parent thread.",
+    label: "Explore",
+    hint: "Explore stays on the parent for Standard Harness unless a custom definition sets child execution. Unset inherits the parent thread.",
   },
   plan: {
-    label: "Planner",
-    hint: "Plan-arc child. Submits a plan packet; the operator must approve before Worker starts.",
+    label: "Plan",
+    hint: "Plan stays on the parent for Standard Harness unless a custom definition sets child execution.",
   },
   workerFirst: {
-    label: "Worker + Tester (first node)",
-    hint: "First Worker child. Prewalk frontier — usually the expensive model.",
+    label: "Worker (first node)",
+    hint: "First Worker child. Prewalk frontier.",
   },
   workerRest: {
-    label: "Worker + Tester (later nodes)",
-    hint: "Later Worker children, including the one-shot correction Worker. Prewalk commodity.",
+    label: "Worker (later nodes)",
+    hint: "Later Worker children. Prewalk commodity.",
   },
   critic: {
-    label: "Reviewer",
-    hint: "Critic-arc child. Returns APPROVE, CORRECTION_REQUIRED, or BLOCKED.",
+    label: "Critic",
+    hint: "Critic may rewind Worker with APPROVE, REWORK, or BLOCK.",
   },
   promote: {
     label: "Promote",
-    hint: "Promote-arc child. Reports the outcome and stops.",
+    hint: "The job is unfinished until you communicate it. Spawns a child on Standard Harness.",
   },
 };
 
@@ -101,13 +102,30 @@ export function routingSlotFor(phase: Phase, workerIndex: number): RoutingSlot {
   return "workerRest";
 }
 
-export function isSpawnablePhase(phase: Phase): boolean {
-  return phase === "worker" || phase === "critic" || phase === "promote";
+export const EXECUTION_MODES = ["parent", "child"] as const;
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+
+export function isExecutionMode(value: string): value is ExecutionMode {
+  return (EXECUTION_MODES as readonly string[]).includes(value);
 }
 
-/** Every executable Harness run node, including Scout and Planner, is a visible child. */
-export function isRunRoleSpawnable(_phase: Phase): boolean {
-  return true;
+export const DEFAULT_EXECUTION: Record<Phase, ExecutionMode> = {
+  explore: "parent",
+  plan: "parent",
+  worker: "child",
+  critic: "child",
+  promote: "child",
+};
+
+export function isSpawnablePhase(phase: Phase): boolean {
+  return DEFAULT_EXECUTION[phase] === "child";
+}
+
+export function nodeSpawnsChild(node: {
+  phase: Phase;
+  execution?: ExecutionMode;
+}): boolean {
+  return (node.execution ?? DEFAULT_EXECUTION[node.phase]) === "child";
 }
 
 export const PHASE_COPY: Record<
@@ -122,7 +140,7 @@ export const PHASE_COPY: Record<
   plan: {
     label: "Plan",
     verb: "Planning",
-    summary: "Turn exploration into an approved plan packet. v1 then runs one Worker.",
+    summary: "Turn exploration into an explicit DAG. Name each node and its dependencies.",
   },
   worker: {
     label: "Worker",
@@ -185,17 +203,18 @@ export function parseExecutionChoice(value: unknown): ExecutionChoice | null {
   const record = value as Record<string, unknown>;
   if (
     typeof record.providerId !== "string" ||
-    record.providerId.length === 0 ||
     typeof record.model !== "string" ||
-    record.model.length === 0 ||
     typeof record.reasoningLevel !== "string" ||
     !isReasoningLevel(record.reasoningLevel)
   ) {
     return null;
   }
+  const providerId = record.providerId.trim();
+  const model = record.model.trim();
+  if (providerId.length === 0 || model.length === 0) return null;
   const choice: ExecutionChoice = {
-    providerId: record.providerId,
-    model: record.model,
+    providerId,
+    model,
     reasoningLevel: record.reasoningLevel,
   };
   if (record.serviceTier === "default" || record.serviceTier === "fast") {
@@ -233,6 +252,8 @@ export type PlanNode = {
   model?: string | null;
   reasoningLevel?: string | null;
   serviceTier?: string | null;
+  execution?: ExecutionMode;
+  skills?: string[];
 };
 
 export function nodeChoice(node: PlanNode): ExecutionChoice | null {
@@ -291,7 +312,7 @@ export function readyNodes<T extends PlanNode>(nodes: readonly T[]): T[] {
 }
 
 export function activeNode<T extends PlanNode>(nodes: readonly T[]): T | null {
-  return nodes.find((node) => node.status === "in_progress") ?? null;
+  return nodes.find((node) => node.status === "in_progress" || node.status === "starting") ?? null;
 }
 
 export function nextWorkNode<T extends PlanNode>(nodes: readonly T[]): T | null {
@@ -305,46 +326,140 @@ export function workerOrdinal(nodes: readonly PlanNode[], nodeId: string): numbe
   return workers.findIndex((node) => node.id === nodeId);
 }
 
-export function seedArcNodes(): Array<
-  Omit<PlanNode, "status" | "sortOrder"> & { sortOrder?: number }
-> {
-  return [
-    {
-      id: "explore",
-      title: "Explore the problem",
-      detail: "Read the system. Isolate the real constraint. Do not implement yet.",
-      phase: "explore",
-      deps: [],
-    },
-    {
-      id: "plan",
-      title: "Write the DAG",
-      detail: "Name each node and its dependencies. One node, one outcome.",
-      phase: "plan",
-      deps: ["explore"],
-    },
-    {
-      id: "worker",
-      title: "Implement the next node",
-      detail: "Do one DAG node. Keep auditable output in artifacts/.",
-      phase: "worker",
-      deps: ["plan"],
-    },
-    {
-      id: "critic",
-      title: "Critique and simplify",
-      detail: "Question what shipped. Send work back if it does not hold.",
-      phase: "critic",
-      deps: ["worker"],
-    },
-    {
-      id: "promote",
-      title: "Promote the result",
-      detail: "Tell the people who need to know. A silent ship is unfinished.",
-      phase: "promote",
-      deps: ["critic"],
-    },
-  ];
+export function routingChoiceForPlanNode(
+  nodes: readonly PlanNode[],
+  node: PlanNode,
+  routing: RoleRouting,
+): ExecutionChoice | null {
+  const override = nodeChoice(node);
+  if (override) return override;
+  const ordinal = workerOrdinal(nodes, node.id);
+  return routing[routingSlotFor(node.phase, ordinal >= 0 ? ordinal : 0)];
+}
+
+/** Exact id wins; otherwise a bare phase name aliases the seeded `{planId}-{phase}` node. */
+export function resolveNodeRef(
+  nodes: readonly Pick<PlanNode, "id" | "phase" | "sortOrder">[],
+  requested: string,
+  planId: string,
+): string {
+  if (nodes.some((node) => node.id === requested)) return requested;
+  if (isPhase(requested)) {
+    const seeded = seedNodeId(planId, requested);
+    if (nodes.some((node) => node.id === seeded)) return seeded;
+    const match = nodes
+      .filter((node) => node.phase === requested)
+      .sort((a, b) => a.sortOrder - b.sortOrder)[0];
+    if (match) return match.id;
+  }
+  return requested;
+}
+
+export function resolveDependencyIds(
+  nodes: readonly Pick<PlanNode, "id" | "phase" | "sortOrder">[],
+  deps: readonly string[],
+  planId: string,
+): string[] {
+  return deps.map((dep) => {
+    const resolved = resolveNodeRef(nodes, dep, planId);
+    if (!nodes.some((node) => node.id === resolved)) {
+      throw new Error(`Unknown dependency ${dep}`);
+    }
+    return resolved;
+  });
+}
+
+export function assertNewNodeDeps(
+  nodes: readonly PlanNode[],
+  node: Pick<PlanNode, "id" | "title" | "detail" | "phase" | "status" | "sortOrder"> & {
+    deps: string[];
+  },
+): void {
+  const known = new Set(nodes.map((item) => item.id));
+  known.add(node.id);
+  const unknown = node.deps.filter((dep) => !known.has(dep));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown dependency ${unknown.join(", ")}`);
+  }
+  if (wouldCycle([...nodes, { ...node, deps: node.deps }], node.id, node.deps)) {
+    throw new Error("That dependency list would create a cycle.");
+  }
+}
+
+export function namespacedNodeId(
+  planId: string,
+  title: string,
+  taken: ReadonlySet<string>,
+  unique: () => string,
+): string {
+  const base = `${planId}-${slugId(title)}`;
+  if (!taken.has(base)) return base;
+  let id = `${base}-${unique()}`;
+  while (taken.has(id)) id = `${base}-${unique()}`;
+  return id;
+}
+
+export type PhaseSpec = {
+  title: string;
+  detail: string;
+  execution: ExecutionMode;
+  skills: string[];
+};
+
+export const DEFAULT_PHASE_SPECS: Record<Phase, PhaseSpec> = {
+  explore: {
+    title: "Explore the problem",
+    detail: "Read the system. Isolate the real constraint. Do not implement yet.",
+    execution: "parent",
+    skills: [],
+  },
+  plan: {
+    title: "Write the DAG",
+    detail: "Name each node and its dependencies. One node, one outcome.",
+    execution: "parent",
+    skills: [],
+  },
+  worker: {
+    title: "Implement the next node",
+    detail: "Do one DAG node. Keep auditable output in artifacts/.",
+    execution: "child",
+    skills: [],
+  },
+  critic: {
+    title: "Critique and simplify",
+    detail: "Return APPROVE, REWORK, or BLOCK. Send work back if it does not hold.",
+    execution: "child",
+    skills: [],
+  },
+  promote: {
+    title: "Promote the result",
+    detail: "Tell the people who need to know. A silent ship is unfinished.",
+    execution: "child",
+    skills: [],
+  },
+};
+
+export function seedNodeId(planId: string, phase: Phase): string {
+  return `${planId}-${phase}`;
+}
+
+export function seedArcNodes(
+  planId: string,
+  phaseSpecs: Record<Phase, PhaseSpec> = DEFAULT_PHASE_SPECS,
+): Array<Omit<PlanNode, "status" | "sortOrder"> & { sortOrder?: number }> {
+  return PHASES.map((phase, index) => {
+    const spec = phaseSpecs[phase] ?? DEFAULT_PHASE_SPECS[phase];
+    const previous = index > 0 ? PHASES[index - 1]! : null;
+    return {
+      id: seedNodeId(planId, phase),
+      title: spec.title,
+      detail: spec.detail,
+      phase,
+      execution: spec.execution ?? DEFAULT_EXECUTION[phase],
+      skills: [...(spec.skills ?? [])],
+      deps: previous ? [seedNodeId(planId, previous)] : [],
+    };
+  });
 }
 
 export function slugId(title: string): string {

@@ -1,18 +1,24 @@
 # bb-plugin-harness
 
-A BB plugin for [Scott Fryxell's harness philosophy](https://scott-fryxell.github.io/blog/the-harness-is-the-thing): the harness is the fulcrum between your expectations and the model.
+A BB plugin for [Scott Fryxell's harness idea](https://scott-fryxell.github.io/blog/the-harness-is-the-thing): the harness is the fulcrum between your expectations and the model.
 
 **Explore → Plan → Worker → Critic → Promote.** Isolated roles. Explicit DAG. One node at a time. Auditable output in `artifacts/`.
 
-Worker, Critic, and Promote spawn a **child thread**. Explore and Plan stay on the parent. Pick a real provider/model per role in plugin settings, or override it on a DAG node.
+**Standard Harness** is the built-in, immutable default. Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn a visible child. Critic completes with **APPROVE**, **REWORK**, or **BLOCK**. Promote communicates. It is not a template.
+
+**Create Harness** clones Standard into a saved custom definition: name, description, per-phase instructions, parent/child execution, artifact policy, promote mode (`always` or `off`), and a correction ceiling. Built-ins are immutable. Starting snapshots the resolved definition into that thread's plan. This plugin injects only its own `harness-arc` skill; arbitrary BB skill names are not a custom-Harness control.
+
+Ordinary chats stay inactive until you explicitly Start Harness.
+
+Milestone Pipeline is removed from the product. Historical SQLite tables stay in place so existing plugin databases are not destructively migrated.
 
 ## Surfaces
 
-- **Sidebar → Harness** — per-thread arc, role routing band, DAG checklist, child-thread status
+- **Sidebar → Harness** — Start form and Standard/custom DAG
 - **Thread panel → Harness** — the same UI on the conversation
 - **Settings → Role routing** — host provider/model picker per role
-- **Composer banner** — current phase and next node
-- **`bb harness`** — status, advance, init, plan create/list/show/next/start/complete
+- **Composer banner** — current phase when a Harness is active
+- **`bb harness`** — status, start (`--harness <id>`), advance, init, plan commands
 - **Agent tools** — `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`
 - **Skill** — `skills/harness-arc`
 
@@ -32,15 +38,20 @@ From a thread:
 
 ```
 bb harness status
+bb harness start --task "Ship the feature"
+bb harness start --task "Ship the feature" --harness <custom-id>
 bb harness plan create "Ship the feature"
 bb harness plan start <plan-id> worker
+bb harness plan complete <plan-id> critic --verdict APPROVE --summary "Holds"
 bb harness advance
 bb harness init
 ```
 
 `init` writes `HARNESS.md`, `artifacts/`, and `plans/` into the thread's workspace. Existing files are left alone.
 
-Starting a worker/critic/promote node spawns a visible child thread with that role's provider/model (or the parent thread's, if the slot is unset). Click **Done** on the parent Harness panel after reviewing — idle does not auto-complete the node.
+Starting Standard/custom writes an explicit arc and a uniquely-id'd seeded plan. No child is spawned until you Start a child-execution node. Click **Done** on the parent after review. Critic uses explicit verdicts.
+
+On Start, advisory artifact policy best-effort creates `artifacts/harness/<plan-id>/`. Required mode fails before the run is activated if the workspace is unavailable.
 
 ## Remove
 
@@ -61,3 +72,7 @@ Per-node overrides live on the DAG row in the Harness panel.
 ## Not in this version
 
 Headless product-driver (poster-driver / `npm run make:animation`) is deferred.
+Custom Harnesses keep the five arcs. They do not become a generic DAG builder, hook runner, or automatic model router.
+Plugin RPC is not a tenant security boundary: the plugin runs in-process with the local user. Plan RPCs require the owning parent thread from `threads.get` so a stale UI or child thread cannot mutate another project by accident.
+
+Child token totals come from BB `thread/tokenUsage/updated` when present; missing usage stays null and no cost is invented. Inherited child routing uses `threads.defaultExecutionOptions` when BB provides it; otherwise provider/model stay null with source `inherited-unknown`.

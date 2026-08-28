@@ -1,7 +1,13 @@
 // bb-plugin-harness — five-phase arc + DAG plans for BB threads.
 //
-// Explore → Plan → Worker → Critic → Promote. Worker/critic/promote spawn
-// child threads. Role routing (provider + model) is stored in plugin KV.
+// Explore → Plan → Worker → Critic → Promote. Spawn uses snapshotted execution
+// mode. Role routing is stored in plugin KV. Historical Milestone tables remain.
+//
+// Threat model: BB plugins are full-trust in-process code. Plugin RPC has no
+// authenticated caller distinct from the local user. These checks exist to make
+// accidental/stale cross-project or child-thread plan mutation impossible, not
+// to defend against a malicious local plugin. RPC is not a tenant security
+// boundary.
 import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -13,70 +19,78 @@ import {
   activeNode,
   formatChoice,
   isPhase,
+  isNodeStatus,
   isRoutingSlot,
-  isSpawnablePhase,
   nextPhase,
   nextWorkNode,
   nodeChoice,
+  nodeSpawnsChild,
   parseDeps,
   parseRoleRouting,
   previousPhase,
   recommendedTier,
+  resolveDependencyIds,
+  resolveNodeRef,
+  namespacedNodeId,
+  assertNewNodeDeps,
   routingSlotFor,
-  seedArcNodes,
-  slugId,
   workerOrdinal,
-  wouldCycle,
   type ExecutionChoice,
-  type NodeStatus,
+  type ExecutionMode,
   type Phase,
   type PlanNode,
   type RoleRouting,
 } from "./lib/harness";
 import {
-  AGENT_ROLES,
-  LIVE_RUN_STATUSES,
-  MILESTONE_PIPELINE_ID,
-  PACKET_KINDS,
-  PROMPT_VERSION,
-  REVIEW_VERDICTS,
-  ROLE_PACKET_KIND,
-  ROLE_TITLE,
-  RUN_NODE_STATUSES,
-  RUN_STATUSES,
-  SCHEMA_VERSION,
-  activeRunNode,
-  applyNodeRouting,
-  buildRolePrompt,
-  canApproveCorrection,
-  canApprovePlan,
-  canRetryNode,
-  canStopRun,
-  correctionNodes,
-  firstReadyNode,
-  intentAfterPacket,
-  nodeOverrideChoice,
-  isLiveRunStatus,
-  isTerminalRunStatus,
-  milestonePipelineNodes,
-  parseTaskPacket,
-  participantInstruction,
-  priorPacketsForRole,
-  routingSlotForRunNode,
-  validateRolePacket,
-  type AgentRole,
-  type HarnessRun,
-  type HarnessRunNode,
-  type PacketKind,
-  type RunNodeStatus,
-  type RunStatus,
-  type TaskPacket,
-} from "./lib/run-engine";
+  CUSTOM_HARNESSES_KEY,
+  HARNESS_SCHEMA_VERSION,
+  REMOVED_MILESTONE_PIPELINE_ID,
+  STANDARD_HARNESS_ID,
+  applyHarnessPatch,
+  assertCustomCatalogFits,
+  builtinHarnesses,
+  cloneStandardHarness,
+  isRemovedHarnessId,
+  isReservedHarnessId,
+  parseCustomHarnesses,
+  parseHarnessDefinition,
+  removedHarnessError,
+  resolveHarnessId,
+  snapshotHarness,
+  seedNodesFromDefinition,
+  standardHarnessDefinition,
+  toHarnessRef,
+  type HarnessDefinition,
+} from "./lib/definitions";
+import {
+  ARTIFACT_POLICIES,
+  CRITIC_VERDICTS,
+  MAX_ARTIFACT_PATH_LENGTH,
+  MAX_ARTIFACT_PATHS,
+  MAX_CORRECTIONS,
+  MAX_RESULT_SUMMARY,
+  PLUGIN_SKILL_NAME,
+  PROMOTE_MODES,
+  addTokenCounters,
+  artifactDirForPlan,
+  artifactManifestPath,
+  canRework,
+  durationMs,
+  emptyTokenCounters,
+  parseArtifactPaths,
+  parseTokenUsageEvent,
+  type CriticVerdict,
+  type TokenCounters,
+} from "./lib/outcomes";
 
 const REALTIME_CHANNEL = "harness";
+const HISTORICAL_LIVE_RUN =
+  "('configuring','running','awaiting_plan_approval','awaiting_correction_approval')";
 
 const phaseSchema = z.enum(PHASES);
-const nodeStatusSchema = z.enum(["pending", "in_progress", "done", "skipped"]);
+const nodeStatusSchema = z.enum(["pending", "starting", "in_progress", "done", "skipped"]);
+const executionModeSchema = z.enum(["parent", "child"]);
+const criticVerdictSchema = z.enum(CRITIC_VERDICTS);
 
 const arcSchema = z.object({
   threadId: z.string(),
@@ -88,8 +102,8 @@ const arcSchema = z.object({
 
 const reasoningLevelSchema = z.enum(REASONING_LEVELS);
 const executionChoiceSchema = z.object({
-  providerId: z.string(),
-  model: z.string(),
+  providerId: z.string().trim().min(1),
+  model: z.string().trim().min(1),
   reasoningLevel: reasoningLevelSchema,
   serviceTier: z.enum(["default", "fast"]).optional(),
 });
@@ -107,6 +121,32 @@ const childThreadSchema = z.object({
   status: z.string(),
   providerId: z.string(),
 });
+const tokenCountersSchema = z.object({
+  input: z.number().nullable(),
+  cached: z.number().nullable(),
+  output: z.number().nullable(),
+  reasoning: z.number().nullable(),
+  total: z.number().nullable(),
+});
+const nodeResultSchema = z.object({
+  verdict: criticVerdictSchema.nullable(),
+  summary: z.string().nullable(),
+  artifactPaths: z.array(z.string()),
+  actor: z.string(),
+  source: z.string(),
+  createdAt: z.number(),
+});
+const nodeAttemptSchema = z.object({
+  id: z.string(),
+  childThreadId: z.string().nullable(),
+  providerId: z.string().nullable(),
+  model: z.string().nullable(),
+  startedAt: z.number().nullable(),
+  endedAt: z.number().nullable(),
+  durationMs: z.number().nullable(),
+  tokens: tokenCountersSchema,
+  source: z.string(),
+});
 const planNodeSchema = z.object({
   id: z.string(),
   title: z.string(),
@@ -120,7 +160,65 @@ const planNodeSchema = z.object({
   model: z.string().nullable(),
   reasoningLevel: z.string().nullable(),
   serviceTier: z.string().nullable(),
+  execution: executionModeSchema,
+  skills: z.array(z.string()),
   child: childThreadSchema.nullable(),
+  result: nodeResultSchema.nullable(),
+  attempt: nodeAttemptSchema.nullable(),
+  attempts: z.array(nodeAttemptSchema),
+});
+
+const phaseSpecSchema = z.object({
+  title: z.string(),
+  detail: z.string(),
+  execution: executionModeSchema,
+  skills: z.array(z.string()),
+});
+const harnessDefinitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  kind: z.enum(["builtin", "custom"]),
+  engine: z.enum(["manual"]),
+  schemaVersion: z.literal(HARNESS_SCHEMA_VERSION),
+  phases: z.object({
+    explore: phaseSpecSchema,
+    plan: phaseSpecSchema,
+    worker: phaseSpecSchema,
+    critic: phaseSpecSchema,
+    promote: phaseSpecSchema,
+  }),
+  artifactPolicy: z.enum(ARTIFACT_POLICIES),
+  promoteMode: z.enum(PROMOTE_MODES),
+  maxCorrections: z.number().int().min(0).max(MAX_CORRECTIONS).nullable(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+const harnessRefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  kind: z.enum(["builtin", "custom"]),
+  engine: z.enum(["manual"]),
+});
+const harnessDraftSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(500).optional(),
+  phases: z
+    .object({
+      explore: phaseSpecSchema.partial().optional(),
+      plan: phaseSpecSchema.partial().optional(),
+      worker: phaseSpecSchema.partial().optional(),
+      critic: phaseSpecSchema.partial().optional(),
+      promote: phaseSpecSchema.partial().optional(),
+    })
+    .optional(),
+  artifactPolicy: z.enum(ARTIFACT_POLICIES).optional(),
+  promoteMode: z.preprocess(
+    (value) => (value === "ask" ? "always" : value),
+    z.enum(PROMOTE_MODES).optional(),
+  ),
+  maxCorrections: z.number().int().min(0).max(MAX_CORRECTIONS).nullable().optional(),
 });
 
 const planMetaSchema = z.object({
@@ -132,85 +230,27 @@ const planMetaSchema = z.object({
   updatedAt: z.number(),
   nodeCount: z.number(),
   doneCount: z.number(),
+  harnessId: z.string().nullable(),
+  correctionCount: z.number(),
+  criticBlocked: z.boolean(),
+});
+
+const planTotalsSchema = z.object({
+  durationMs: z.number().nullable(),
+  tokens: tokenCountersSchema,
 });
 
 const planFullSchema = planMetaSchema.extend({
   nodes: z.array(planNodeSchema),
+  harnessSnapshot: harnessDefinitionSchema.nullable(),
+  totals: planTotalsSchema,
+  skillWarnings: z.array(z.string()),
 });
 
 export type ArcDto = z.infer<typeof arcSchema>;
 export type PlanNodeDto = z.infer<typeof planNodeSchema>;
 export type PlanMetaDto = z.infer<typeof planMetaSchema>;
 export type PlanFullDto = z.infer<typeof planFullSchema>;
-export type HarnessStatusDto = z.infer<typeof statusSchema>;
-
-const runNodeSchema = z.object({
-  id: z.string(),
-  runId: z.string(),
-  templateNodeKey: z.string(),
-  role: z.enum(AGENT_ROLES),
-  phase: phaseSchema,
-  ordinal: z.number(),
-  status: z.enum(RUN_NODE_STATUSES),
-  deps: z.array(z.string()),
-  childThreadId: z.string().nullable(),
-  providerId: z.string().nullable(),
-  model: z.string().nullable(),
-  reasoningLevel: z.string().nullable(),
-  serviceTier: z.string().nullable(),
-  startedAt: z.number().nullable(),
-  completedAt: z.number().nullable(),
-  packetVersion: z.number(),
-  child: childThreadSchema.nullable(),
-});
-
-const packetSchema = z.object({
-  id: z.string(),
-  runId: z.string(),
-  runNodeId: z.string(),
-  kind: z.enum(PACKET_KINDS),
-  version: z.number(),
-  payload: z.unknown(),
-  createdAt: z.number(),
-});
-
-const taskPacketSchema = z.object({
-  objective: z.string(),
-  branch: z.string().nullable(),
-  execPlanPath: z.string().nullable(),
-  protectedPaths: z.array(z.string()),
-  runScout: z.boolean(),
-  specialistQuestion: z.string().nullable(),
-  routingOverrides: roleRoutingSchema.nullable(),
-  projectId: z.string(),
-  parentThreadId: z.string(),
-  environmentId: z.string().nullable(),
-  promptVersion: z.string(),
-  schemaVersion: z.string(),
-});
-
-const runDetailsSchema = z.object({
-  id: z.string(),
-  projectId: z.string(),
-  parentThreadId: z.string(),
-  templateId: z.string(),
-  status: z.enum(RUN_STATUSES),
-  currentStageId: z.string().nullable(),
-  taskPacket: taskPacketSchema,
-  correctionCount: z.number(),
-  createdAt: z.number(),
-  updatedAt: z.number(),
-  completedAt: z.number().nullable(),
-  nodes: z.array(runNodeSchema),
-  packets: z.array(packetSchema),
-  currentNode: runNodeSchema.nullable(),
-  controls: z.object({
-    canApprovePlan: z.boolean(),
-    canApproveCorrection: z.boolean(),
-    canStop: z.boolean(),
-    canRetry: z.boolean(),
-  }),
-});
 
 const statusSchema = z.object({
   arc: arcSchema,
@@ -221,21 +261,32 @@ const statusSchema = z.object({
   frontierModel: z.string(),
   prewalkEnabled: z.boolean(),
   routing: roleRoutingSchema,
-  run: runDetailsSchema.nullable(),
+  harness: harnessRefSchema.nullable(),
+  customHarnesses: z.array(harnessDefinitionSchema),
 });
+
+export type HarnessStatusDto = z.infer<typeof statusSchema>;
 
 const startRunInputSchema = z.object({
   threadId: z.string(),
   projectId: z.string().optional(),
   objective: z.string().trim().min(1).max(8000),
-  branch: z.string().trim().max(200).optional(),
-  execPlanPath: z.string().trim().max(500).optional(),
-  protectedPaths: z.array(z.string().trim().min(1).max(500)).max(50).optional(),
-  runScout: z.boolean().optional(),
-  specialistQuestion: z.string().trim().max(4000).optional(),
-  templateId: z.literal(MILESTONE_PIPELINE_ID).optional(),
-  routingOverrides: roleRoutingSchema.optional(),
-  nodeRouting: z.record(z.string(), executionChoiceSchema).optional(),
+  harnessId: z.string().trim().min(1).max(64).optional(),
+  templateId: z.string().trim().min(1).max(64).optional(),
+});
+
+const completeNodeInputSchema = z.object({
+  planId: z.string(),
+  nodeId: z.string(),
+  threadId: z.string(),
+  projectId: z.string().optional(),
+  verdict: criticVerdictSchema.optional(),
+  summary: z.string().trim().max(MAX_RESULT_SUMMARY).optional(),
+  artifactPaths: z.array(z.string().trim().min(1).max(MAX_ARTIFACT_PATH_LENGTH)).max(MAX_ARTIFACT_PATHS).optional(),
+});
+const planAccessSchema = z.object({
+  threadId: z.string(),
+  projectId: z.string().optional(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -277,13 +328,13 @@ export const rpcContract = defineRpcContract({
     output: z.object({ plans: z.array(planMetaSchema) }),
   },
   getPlan: {
-    input: z.object({ id: z.string() }),
+    input: z.object({ id: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema.nullable() }),
   },
   createPlan: {
     input: z.object({
-      projectId: z.string(),
-      threadId: z.string().nullable().optional(),
+      projectId: z.string().optional(),
+      threadId: z.string(),
       name: z.string().trim().min(1).max(200),
       seedArc: z.boolean().optional(),
     }),
@@ -296,15 +347,14 @@ export const rpcContract = defineRpcContract({
       detail: z.string().max(2000).optional(),
       phase: phaseSchema.optional(),
       deps: z.array(z.string()).optional(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   startNode: {
     input: z.object({
       planId: z.string(),
       nodeId: z.string(),
-      threadId: z.string().optional(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   getRouting: {
@@ -323,32 +373,34 @@ export const rpcContract = defineRpcContract({
       planId: z.string(),
       nodeId: z.string(),
       choice: executionChoiceSchema.nullable(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
-  },
-  setRunNodeRouting: {
-    input: z.object({
-      threadId: z.string(),
-      projectId: z.string().optional(),
-      nodeId: z.string(),
-      choice: executionChoiceSchema.nullable(),
-    }),
-    output: statusSchema,
   },
   suggestChoice: {
     input: z.object({}),
     output: z.object({ choice: executionChoiceSchema }),
   },
   completeNode: {
-    input: z.object({ planId: z.string(), nodeId: z.string() }),
+    input: completeNodeInputSchema,
     output: z.object({ plan: planFullSchema }),
   },
   skipNode: {
-    input: z.object({ planId: z.string(), nodeId: z.string() }),
+    input: z.object({ planId: z.string(), nodeId: z.string() }).merge(planAccessSchema),
+    output: z.object({ plan: planFullSchema }),
+  },
+  reopenNode: {
+    input: z.object({ planId: z.string(), nodeId: z.string() }).merge(planAccessSchema),
+    output: z.object({ plan: planFullSchema }),
+  },
+  resetCriticBlock: {
+    input: z.object({ planId: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   initWorkspace: {
-    input: z.object({ threadId: z.string() }),
+    input: z.object({
+      threadId: z.string(),
+      projectId: z.string().optional(),
+    }),
     output: z.object({
       path: z.string(),
       written: z.array(z.string()),
@@ -366,35 +418,21 @@ export const rpcContract = defineRpcContract({
     }),
     output: statusSchema,
   },
-  approvePlan: {
-    input: z.object({
-      threadId: z.string(),
-      projectId: z.string().optional(),
-    }),
-    output: statusSchema,
+  listHarnesses: {
+    input: z.object({}),
+    output: z.object({ harnesses: z.array(harnessDefinitionSchema) }),
   },
-  approveCorrection: {
-    input: z.object({
-      threadId: z.string(),
-      projectId: z.string().optional(),
-    }),
-    output: statusSchema,
+  createHarness: {
+    input: harnessDraftSchema,
+    output: z.object({ harness: harnessDefinitionSchema }),
   },
-  retryStage: {
-    input: z.object({
-      threadId: z.string(),
-      projectId: z.string().optional(),
-      nodeId: z.string().optional(),
-    }),
-    output: statusSchema,
+  updateHarness: {
+    input: harnessDraftSchema.extend({ id: z.string().trim().min(1).max(64) }),
+    output: z.object({ harness: harnessDefinitionSchema }),
   },
-  getRun: {
-    input: z.object({
-      threadId: z.string(),
-      projectId: z.string().optional(),
-      runId: z.string().optional(),
-    }),
-    output: z.object({ run: runDetailsSchema.nullable() }),
+  deleteHarness: {
+    input: z.object({ id: z.string().trim().min(1).max(64) }),
+    output: z.object({ ok: z.literal(true) }),
   },
 });
 
@@ -404,6 +442,8 @@ type ArcRow = {
   phase: string;
   note: string;
   updated_at: number;
+  harness_id: string | null;
+  plan_id: string | null;
 };
 
 type PlanRow = {
@@ -413,6 +453,10 @@ type PlanRow = {
   name: string;
   created_at: number;
   updated_at: number;
+  harness_id: string | null;
+  harness_snapshot: string | null;
+  correction_count: number;
+  critic_blocked: number;
 };
 
 type NodeRow = {
@@ -429,48 +473,38 @@ type NodeRow = {
   model: string | null;
   reasoning_level: string | null;
   service_tier: string | null;
+  execution: string | null;
+  skills: string | null;
 };
 
-type RunRow = {
+type ResultRow = {
   id: string;
-  project_id: string;
-  parent_thread_id: string;
-  template_id: string;
-  status: string;
-  current_stage_id: string | null;
-  task_packet_json: string;
-  correction_count: number;
+  plan_id: string;
+  node_id: string;
+  verdict: string | null;
+  summary: string | null;
+  artifact_paths: string;
+  actor: string;
+  source: string;
   created_at: number;
-  updated_at: number;
-  completed_at: number | null;
 };
 
-type RunNodeRow = {
+type AttemptRow = {
   id: string;
-  run_id: string;
-  template_node_key: string;
-  role: string;
-  phase: string;
-  ordinal: number;
-  status: string;
-  deps: string;
+  plan_id: string;
+  node_id: string;
   child_thread_id: string | null;
   provider_id: string | null;
   model: string | null;
-  reasoning_level: string | null;
-  service_tier: string | null;
   started_at: number | null;
-  completed_at: number | null;
-  packet_version: number;
-};
-
-type PacketRow = {
-  id: string;
-  run_id: string;
-  run_node_id: string;
-  kind: string;
-  version: number;
-  payload_json: string;
+  ended_at: number | null;
+  duration_ms: number | null;
+  tokens_input: number | null;
+  tokens_cached: number | null;
+  tokens_output: number | null;
+  tokens_reasoning: number | null;
+  tokens_total: number | null;
+  source: string;
   created_at: number;
 };
 
@@ -478,13 +512,30 @@ function shortId(): string {
   return randomUUID().slice(0, 8);
 }
 
+function parseSkillsJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 function toNode(row: NodeRow): PlanNode {
+  const phase = isPhase(row.phase) ? row.phase : "worker";
+  const execution =
+    row.execution === "parent" || row.execution === "child"
+      ? (row.execution as ExecutionMode)
+      : undefined;
   return {
     id: row.id,
     title: row.title,
     detail: row.detail,
-    phase: isPhase(row.phase) ? row.phase : "worker",
-    status: row.status as NodeStatus,
+    phase,
+    status: isNodeStatus(row.status) ? row.status : "pending",
     deps: parseDeps(row.deps),
     sortOrder: row.sort_order,
     childThreadId: row.child_thread_id ?? null,
@@ -492,6 +543,18 @@ function toNode(row: NodeRow): PlanNode {
     model: row.model ?? null,
     reasoningLevel: row.reasoning_level ?? null,
     serviceTier: row.service_tier ?? null,
+    execution,
+    skills: parseSkillsJson(row.skills),
+  };
+}
+
+function tokensFromAttempt(row: AttemptRow): TokenCounters {
+  return {
+    input: row.tokens_input,
+    cached: row.tokens_cached,
+    output: row.tokens_output,
+    reasoning: row.tokens_reasoning,
+    total: row.tokens_total,
   };
 }
 
@@ -502,18 +565,16 @@ function usage(): string {
     "  bb harness advance [--thread <id>] [--json]",
     "  bb harness rewind [--thread <id>] [--json]",
     "  bb harness set-phase <explore|plan|worker|critic|promote> [--thread <id>] [--json]",
-    "  bb harness start --task <text> [--no-scout] [--exec-plan <path>] [--branch <name>] [--protected a,b] [--specialist <q>] [--thread <id>] [--json]",
+    "  bb harness start --task <text> [--harness <id>] [--thread <id>] [--json]",
     "  bb harness stop [--thread <id>] [--json]",
-    "  bb harness approve-plan [--thread <id>] [--json]",
-    "  bb harness approve-correction [--thread <id>] [--json]",
-    "  bb harness retry [--node <id>] [--thread <id>] [--json]",
     "  bb harness plan list [--json]",
     "  bb harness plan show <plan-id> [--json]",
     "  bb harness plan create <name> [--seed] [--no-seed] [--thread <id>] [--json]",
     "  bb harness plan add <plan-id> <title> [--phase <phase>] [--deps id,id] [--json]",
     "  bb harness plan next <plan-id> [--json]",
     "  bb harness plan start <plan-id> <node-id> [--json]",
-    "  bb harness plan complete <plan-id> <node-id> [--json]",
+    "  bb harness plan complete <plan-id> <node-id> [--verdict APPROVE|REWORK|BLOCK] [--summary <text>] [--json]",
+    "  bb harness plan reset-block <plan-id> [--json]",
   ].join("\n");
 }
 
@@ -609,7 +670,62 @@ export default async function plugin(bb: BbPluginApi) {
        UNIQUE(run_node_id, version)
      )`,
     `CREATE INDEX IF NOT EXISTS harness_packets_run_idx ON harness_packets(run_id, created_at)`,
+    `ALTER TABLE plans ADD COLUMN harness_id TEXT`,
+    `ALTER TABLE plans ADD COLUMN harness_snapshot TEXT`,
+    `ALTER TABLE arcs ADD COLUMN harness_id TEXT`,
+    `ALTER TABLE plan_nodes ADD COLUMN execution TEXT`,
+    `ALTER TABLE plan_nodes ADD COLUMN skills TEXT`,
+    `ALTER TABLE plans ADD COLUMN correction_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE plans ADD COLUMN critic_blocked INTEGER NOT NULL DEFAULT 0`,
+    `CREATE TABLE IF NOT EXISTS plan_node_results (
+       id TEXT PRIMARY KEY,
+       plan_id TEXT NOT NULL,
+       node_id TEXT NOT NULL,
+       verdict TEXT,
+       summary TEXT,
+       artifact_paths TEXT NOT NULL DEFAULT '[]',
+       actor TEXT NOT NULL,
+       source TEXT NOT NULL,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS plan_node_results_node_idx
+       ON plan_node_results(plan_id, node_id, created_at)`,
+    `CREATE TABLE IF NOT EXISTS harness_artifacts (
+       id TEXT PRIMARY KEY,
+       plan_id TEXT NOT NULL,
+       node_id TEXT,
+       path TEXT NOT NULL,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS harness_artifacts_plan_idx ON harness_artifacts(plan_id, created_at)`,
+    `CREATE TABLE IF NOT EXISTS plan_node_attempts (
+       id TEXT PRIMARY KEY,
+       plan_id TEXT NOT NULL,
+       node_id TEXT NOT NULL,
+       child_thread_id TEXT,
+       provider_id TEXT,
+       model TEXT,
+       started_at INTEGER,
+       ended_at INTEGER,
+       duration_ms INTEGER,
+       tokens_input INTEGER,
+       tokens_cached INTEGER,
+       tokens_output INTEGER,
+       tokens_reasoning INTEGER,
+       tokens_total INTEGER,
+       source TEXT NOT NULL,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE INDEX IF NOT EXISTS plan_node_attempts_node_idx
+       ON plan_node_attempts(plan_id, node_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS plan_node_attempts_child_idx ON plan_node_attempts(child_thread_id)`,
+    `ALTER TABLE arcs ADD COLUMN plan_id TEXT`,
   ]);
+  // Append-only migrate can skip a shifted ALTER; add the column if it is still missing.
+  const arcColumns = db.prepare("PRAGMA table_info(arcs)").all() as Array<{ name: string }>;
+  if (!arcColumns.some((column) => column.name === "plan_id")) {
+    db.exec("ALTER TABLE arcs ADD COLUMN plan_id TEXT");
+  }
 
   const settings = bb.settings.define({
     frontierModel: {
@@ -634,15 +750,24 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const selectArc = db.prepare("SELECT * FROM arcs WHERE thread_id = ?");
+  const insertArc = db.prepare(
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id, @plan_id)`,
+  );
   const upsertArc = db.prepare(
-    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at)
-     VALUES (@thread_id, @project_id, @phase, @note, @updated_at)
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id, @plan_id)
      ON CONFLICT(thread_id) DO UPDATE SET
        project_id = excluded.project_id,
        phase = excluded.phase,
        note = excluded.note,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       harness_id = excluded.harness_id`,
   );
+  const bindArcPlanId = db.prepare(
+    `UPDATE arcs SET plan_id = ? WHERE thread_id = ? AND plan_id IS NULL`,
+  );
+  const deleteArc = db.prepare("DELETE FROM arcs WHERE thread_id = ?");
   const selectPlan = db.prepare("SELECT * FROM plans WHERE id = ?");
   const selectPlans = db.prepare(
     `SELECT * FROM plans WHERE project_id = ?
@@ -653,21 +778,45 @@ export default async function plugin(bb: BbPluginApi) {
      ORDER BY updated_at DESC`,
   );
   const insertPlan = db.prepare(
-    `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at)
-     VALUES (@id, @project_id, @thread_id, @name, @created_at, @updated_at)`,
+    `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at, harness_id, harness_snapshot, correction_count, critic_blocked)
+     VALUES (@id, @project_id, @thread_id, @name, @created_at, @updated_at, @harness_id, @harness_snapshot, @correction_count, @critic_blocked)`,
   );
   const touchPlan = db.prepare(
     "UPDATE plans SET updated_at = ? WHERE id = ?",
+  );
+  const updatePlanSnapshot = db.prepare(
+    "UPDATE plans SET harness_id = ?, harness_snapshot = ?, updated_at = ? WHERE id = ?",
+  );
+  const updatePlanFlags = db.prepare(
+    "UPDATE plans SET correction_count = ?, critic_blocked = ?, updated_at = ? WHERE id = ?",
   );
   const selectNodes = db.prepare(
     "SELECT * FROM plan_nodes WHERE plan_id = ? ORDER BY sort_order ASC",
   );
   const insertNode = db.prepare(
-    `INSERT INTO plan_nodes (id, plan_id, title, detail, phase, status, deps, sort_order)
-     VALUES (@id, @plan_id, @title, @detail, @phase, @status, @deps, @sort_order)`,
+    `INSERT INTO plan_nodes (id, plan_id, title, detail, phase, status, deps, sort_order, execution, skills)
+     VALUES (@id, @plan_id, @title, @detail, @phase, @status, @deps, @sort_order, @execution, @skills)`,
   );
   const updateNodeStatus = db.prepare(
     "UPDATE plan_nodes SET status = ? WHERE id = ? AND plan_id = ?",
+  );
+  const claimNodeStatus = db.prepare(
+    "UPDATE plan_nodes SET status = ? WHERE id = ? AND plan_id = ? AND status = ?",
+  );
+  const recoverStartingNode = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'pending'
+     WHERE id = ? AND plan_id = ? AND status = 'starting' AND child_thread_id IS NULL`,
+  );
+  const attachStartingChild = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'in_progress', child_thread_id = ?
+     WHERE id = ? AND plan_id = ? AND status = 'starting'`,
+  );
+  const casFailedChild = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'pending', child_thread_id = NULL
+     WHERE id = ? AND plan_id = ? AND status = 'in_progress' AND child_thread_id = ?`,
   );
   const selectNodeByChild = db.prepare(
     "SELECT * FROM plan_nodes WHERE child_thread_id = ?",
@@ -680,74 +829,71 @@ export default async function plugin(bb: BbPluginApi) {
      SET provider_id = ?, model = ?, reasoning_level = ?, service_tier = ?
      WHERE id = ? AND plan_id = ?`,
   );
-
-  const selectRun = db.prepare("SELECT * FROM harness_runs WHERE id = ?");
-  const selectLiveRun = db.prepare(
+  const resetPlanNode = db.prepare(
+    `UPDATE plan_nodes
+     SET status = ?, child_thread_id = NULL
+     WHERE id = ? AND plan_id = ?`,
+  );
+  const selectAllNodeIds = db.prepare("SELECT id FROM plan_nodes");
+  const insertResult = db.prepare(
+    `INSERT INTO plan_node_results (id, plan_id, node_id, verdict, summary, artifact_paths, actor, source, created_at)
+     VALUES (@id, @plan_id, @node_id, @verdict, @summary, @artifact_paths, @actor, @source, @created_at)`,
+  );
+  const selectResultsForPlan = db.prepare(
+    `SELECT * FROM plan_node_results WHERE plan_id = ? ORDER BY created_at ASC`,
+  );
+  const insertArtifact = db.prepare(
+    `INSERT INTO harness_artifacts (id, plan_id, node_id, path, created_at)
+     VALUES (@id, @plan_id, @node_id, @path, @created_at)`,
+  );
+  const insertAttempt = db.prepare(
+    `INSERT INTO plan_node_attempts (
+       id, plan_id, node_id, child_thread_id, provider_id, model, started_at, ended_at,
+       duration_ms, tokens_input, tokens_cached, tokens_output, tokens_reasoning, tokens_total, source, created_at
+     ) VALUES (
+       @id, @plan_id, @node_id, @child_thread_id, @provider_id, @model, @started_at, @ended_at,
+       @duration_ms, @tokens_input, @tokens_cached, @tokens_output, @tokens_reasoning, @tokens_total, @source, @created_at
+     )`,
+  );
+  const updateAttempt = db.prepare(
+    `UPDATE plan_node_attempts
+     SET ended_at = @ended_at, duration_ms = @duration_ms,
+         tokens_input = @tokens_input, tokens_cached = @tokens_cached,
+         tokens_output = @tokens_output, tokens_reasoning = @tokens_reasoning,
+         tokens_total = @tokens_total
+     WHERE id = @id`,
+  );
+  const selectAttemptsForPlan = db.prepare(
+    "SELECT * FROM plan_node_attempts WHERE plan_id = ? ORDER BY created_at ASC",
+  );
+  const selectOpenAttemptByChild = db.prepare(
+    "SELECT * FROM plan_node_attempts WHERE child_thread_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
+  );
+  const selectHistoricalLiveRun = db.prepare(
     `SELECT * FROM harness_runs
      WHERE parent_thread_id = ?
-       AND status IN ('configuring','running','awaiting_plan_approval','awaiting_correction_approval')
+       AND status IN ${HISTORICAL_LIVE_RUN}
      ORDER BY created_at DESC LIMIT 1`,
   );
-  const selectLatestRun = db.prepare(
-    `SELECT * FROM harness_runs WHERE parent_thread_id = ? ORDER BY created_at DESC LIMIT 1`,
-  );
-  const insertRun = db.prepare(
-    `INSERT INTO harness_runs (
-       id, project_id, parent_thread_id, template_id, status, current_stage_id,
-       task_packet_json, correction_count, created_at, updated_at, completed_at
-     ) VALUES (
-       @id, @project_id, @parent_thread_id, @template_id, @status, @current_stage_id,
-       @task_packet_json, @correction_count, @created_at, @updated_at, @completed_at
-     )`,
-  );
-  const updateRunRow = db.prepare(
-    `UPDATE harness_runs
-     SET status = @status, current_stage_id = @current_stage_id,
-         correction_count = @correction_count, updated_at = @updated_at,
-         completed_at = @completed_at
-     WHERE id = @id`,
-  );
-  const selectRunNodes = db.prepare(
-    "SELECT * FROM harness_run_nodes WHERE run_id = ? ORDER BY ordinal ASC",
-  );
-  const selectRunNode = db.prepare("SELECT * FROM harness_run_nodes WHERE id = ?");
-  const selectRunNodeByChild = db.prepare(
+  const selectHistoricalRunNodeByChild = db.prepare(
     "SELECT * FROM harness_run_nodes WHERE child_thread_id = ?",
   );
-  const insertRunNode = db.prepare(
-    `INSERT INTO harness_run_nodes (
-       id, run_id, template_node_key, role, phase, ordinal, status, deps,
-       child_thread_id, provider_id, model, reasoning_level, service_tier,
-       started_at, completed_at, packet_version
-     ) VALUES (
-       @id, @run_id, @template_node_key, @role, @phase, @ordinal, @status, @deps,
-       @child_thread_id, @provider_id, @model, @reasoning_level, @service_tier,
-       @started_at, @completed_at, @packet_version
-     )`,
+  const cancelHistoricalRun = db.prepare(
+    `UPDATE harness_runs SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE id = ?`,
   );
-  const updateRunNodeRow = db.prepare(
-    `UPDATE harness_run_nodes
-     SET status = @status, child_thread_id = @child_thread_id,
-         started_at = @started_at, completed_at = @completed_at,
-         packet_version = @packet_version, deps = @deps,
-         provider_id = @provider_id, model = @model,
-         reasoning_level = @reasoning_level, service_tier = @service_tier
-     WHERE id = @id`,
+  const failHistoricalRunNode = db.prepare(
+    `UPDATE harness_run_nodes SET status = 'failed', completed_at = ? WHERE run_id = ? AND status IN ('in_progress','starting')`,
   );
-  const selectPackets = db.prepare(
-    "SELECT * FROM harness_packets WHERE run_id = ? ORDER BY created_at ASC",
-  );
-  const selectPacketForNodeVersion = db.prepare(
-    "SELECT * FROM harness_packets WHERE run_node_id = ? AND version = ?",
-  );
-  const insertPacket = db.prepare(
-    `INSERT INTO harness_packets (id, run_id, run_node_id, kind, version, payload_json, created_at)
-     VALUES (@id, @run_id, @run_node_id, @kind, @version, @payload_json, @created_at)`,
+  const selectHistoricalRunNodes = db.prepare(
+    "SELECT child_thread_id FROM harness_run_nodes WHERE run_id = ?",
   );
 
   const ROUTING_KEY = "routing";
   let currentRouting: RoleRouting = parseRoleRouting(
     await bb.storage.kv.get(ROUTING_KEY),
+  );
+  let customHarnesses: HarnessDefinition[] = parseCustomHarnesses(
+    await bb.storage.kv.get(CUSTOM_HARNESSES_KEY),
   );
 
   async function saveRouting(next: RoleRouting): Promise<RoleRouting> {
@@ -757,617 +903,59 @@ export default async function plugin(bb: BbPluginApi) {
     return next;
   }
 
+  async function saveCustomHarnesses(
+    next: HarnessDefinition[],
+  ): Promise<HarnessDefinition[]> {
+    assertCustomCatalogFits(next);
+    await bb.storage.kv.set(CUSTOM_HARNESSES_KEY, next);
+    customHarnesses = next;
+    publish();
+    return next;
+  }
+
+  function catalogHarnesses(): HarnessDefinition[] {
+    return [...builtinHarnesses(), ...customHarnesses];
+  }
+
+  function findHarness(id: string, snapshot?: HarnessDefinition | null): HarnessDefinition | null {
+    const fromCatalog = catalogHarnesses().find((item) => item.id === id);
+    if (fromCatalog) return fromCatalog;
+    if (snapshot && snapshot.id === id) return snapshot;
+    return null;
+  }
+
+  function requireHarness(id: string): HarnessDefinition {
+    if (isRemovedHarnessId(id) || id === REMOVED_MILESTONE_PIPELINE_ID) {
+      throw new Error(removedHarnessError(id));
+    }
+    const found = findHarness(id);
+    if (!found) throw new Error(`Unknown Harness ${id}.`);
+    return found;
+  }
+
   function publish(): void {
     bb.realtime.publish(REALTIME_CHANNEL, { at: Date.now() });
   }
 
-  function toRunNode(row: RunNodeRow): HarnessRunNode {
-    return {
-      id: row.id,
-      runId: row.run_id,
-      templateNodeKey: row.template_node_key,
-      role: row.role as AgentRole,
-      phase: isPhase(row.phase) ? row.phase : "worker",
-      ordinal: row.ordinal,
-      status: row.status as RunNodeStatus,
-      deps: parseDeps(row.deps),
-      childThreadId: row.child_thread_id,
-      providerId: row.provider_id,
-      model: row.model,
-      reasoningLevel: row.reasoning_level,
-      serviceTier: row.service_tier,
-      startedAt: row.started_at,
-      completedAt: row.completed_at,
-      packetVersion: row.packet_version,
-    };
-  }
-
-  function toRun(row: RunRow): HarnessRun {
-    const packet = parseTaskPacket(JSON.parse(row.task_packet_json));
-    if (!packet) {
-      throw new Error(`Run ${row.id} has an invalid task packet`);
-    }
-    return {
-      id: row.id,
-      projectId: row.project_id,
-      parentThreadId: row.parent_thread_id,
-      templateId: row.template_id,
-      status: row.status as RunStatus,
-      currentStageId: row.current_stage_id,
-      taskPacket: packet,
-      correctionCount: row.correction_count,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      completedAt: row.completed_at,
-    };
-  }
-
-  function runNodesOf(runId: string): HarnessRunNode[] {
-    return (selectRunNodes.all(runId) as RunNodeRow[]).map(toRunNode);
-  }
-
-  function persistRun(run: HarnessRun): void {
-    updateRunRow.run({
-      id: run.id,
-      status: run.status,
-      current_stage_id: run.currentStageId,
-      correction_count: run.correctionCount,
-      updated_at: Date.now(),
-      completed_at: run.completedAt,
-    });
-  }
-
-  function persistRunNode(node: HarnessRunNode): void {
-    updateRunNodeRow.run({
-      id: node.id,
-      status: node.status,
-      child_thread_id: node.childThreadId,
-      started_at: node.startedAt,
-      completed_at: node.completedAt,
-      packet_version: node.packetVersion,
-      deps: JSON.stringify(node.deps),
-      provider_id: node.providerId,
-      model: node.model,
-      reasoning_level: node.reasoningLevel,
-      service_tier: node.serviceTier,
-    });
-  }
-
-  function liveRunFor(threadId: string): HarnessRun | null {
-    const byChild = selectRunNodeByChild.get(threadId) as RunNodeRow | undefined;
-    if (byChild) {
-      const row = selectRun.get(byChild.run_id) as RunRow | undefined;
-      return row && isLiveRunStatus(row.status) ? toRun(row) : null;
-    }
-    const row = selectLiveRun.get(threadId) as RunRow | undefined;
-    return row ? toRun(row) : null;
-  }
-
-  function latestRunFor(threadId: string): HarnessRun | null {
-    const byChild = selectRunNodeByChild.get(threadId) as RunNodeRow | undefined;
-    if (byChild) {
-      const row = selectRun.get(byChild.run_id) as RunRow | undefined;
-      return row ? toRun(row) : null;
-    }
-    const row = selectLatestRun.get(threadId) as RunRow | undefined;
-    return row ? toRun(row) : null;
-  }
-
-  function requireLiveRun(threadId: string): HarnessRun {
-    const run = liveRunFor(threadId);
-    if (!run || !isLiveRunStatus(run.status)) {
-      throw new Error("No active Harness run. Start one with bb harness start.");
-    }
-    return run;
-  }
-
-  function phaseFromRun(run: HarnessRun, nodes = runNodesOf(run.id)): Phase {
-    const current = nodes.find((node) => node.id === run.currentStageId) ?? activeRunNode(nodes);
-    if (current) return current.phase;
-    const last = [...nodes].reverse().find((node) => node.status === "done" || node.status === "skipped");
-    return last?.phase ?? "explore";
-  }
-
-  function resolvedRunChoice(nodes: HarnessRunNode[], node: HarnessRunNode, packet: TaskPacket): ExecutionChoice | null {
-    const override = nodeOverrideChoice(node);
-    if (override) return override;
-    const slot = routingSlotForRunNode(nodes, node);
-    if (packet.routingOverrides) return packet.routingOverrides[slot];
-    return currentRouting[slot];
-  }
-
-  async function enrichRunNodes(nodes: HarnessRunNode[]) {
-    return Promise.all(
-      nodes.map(async (node) => {
-        const base = {
-          id: node.id,
-          runId: node.runId,
-          templateNodeKey: node.templateNodeKey,
-          role: node.role,
-          phase: node.phase,
-          ordinal: node.ordinal,
-          status: node.status,
-          deps: node.deps,
-          childThreadId: node.childThreadId,
-          providerId: node.providerId,
-          model: node.model,
-          reasoningLevel: node.reasoningLevel,
-          serviceTier: node.serviceTier,
-          startedAt: node.startedAt,
-          completedAt: node.completedAt,
-          packetVersion: node.packetVersion,
-          child: null as z.infer<typeof childThreadSchema> | null,
-        };
-        if (!node.childThreadId) return base;
-        try {
-          const thread = await bb.sdk.threads.get({ threadId: node.childThreadId });
-          return {
-            ...base,
-            child: {
-              id: thread.id,
-              title: thread.title ?? thread.titleFallback,
-              status: thread.status,
-              providerId: thread.providerId,
-            },
-          };
-        } catch {
-          return {
-            ...base,
-            child: {
-              id: node.childThreadId,
-              title: null,
-              status: "missing",
-              providerId: "",
-            },
-          };
-        }
-      }),
-    );
-  }
-
-  async function toRunDetails(run: HarnessRun) {
-    const nodes = runNodesOf(run.id);
-    const packets = (selectPackets.all(run.id) as PacketRow[]).map((row) => ({
-      id: row.id,
-      runId: row.run_id,
-      runNodeId: row.run_node_id,
-      kind: row.kind as PacketKind,
-      version: row.version,
-      payload: JSON.parse(row.payload_json) as unknown,
-      createdAt: row.created_at,
-    }));
-    const enriched = await enrichRunNodes(nodes);
-    const currentId = run.currentStageId ?? activeRunNode(nodes)?.id ?? null;
-    const failed = nodes.some((node) => node.status === "failed");
-    return {
-      id: run.id,
-      projectId: run.projectId,
-      parentThreadId: run.parentThreadId,
-      templateId: run.templateId,
-      status: run.status,
-      currentStageId: run.currentStageId,
-      taskPacket: run.taskPacket,
-      correctionCount: run.correctionCount,
-      createdAt: run.createdAt,
-      updatedAt: run.updatedAt,
-      completedAt: run.completedAt,
-      nodes: enriched,
-      packets,
-      currentNode: enriched.find((node) => node.id === currentId) ?? null,
-      controls: {
-        canApprovePlan: canApprovePlan(run),
-        canApproveCorrection: canApproveCorrection(run),
-        canStop: canStopRun(run),
-        canRetry: isLiveRunStatus(run.status) && failed,
-      },
-    };
-  }
-
-  function packetHistory(runId: string) {
-    const nodes = runNodesOf(runId);
-    const byId = new Map(nodes.map((node) => [node.id, node]));
-    return (selectPackets.all(runId) as PacketRow[]).map((row) => {
-      const node = byId.get(row.run_node_id);
-      return {
-        kind: row.kind as PacketKind,
-        role: (node?.role ?? "worker") as AgentRole,
-        payload: JSON.parse(row.payload_json) as unknown,
-        templateNodeKey: node?.templateNodeKey ?? "",
-      };
-    });
-  }
-
-  async function spawnRunNode(run: HarnessRun, node: HarnessRunNode): Promise<void> {
-    if (activeRunNode(runNodesOf(run.id)) && activeRunNode(runNodesOf(run.id))?.id !== node.id) {
-      throw new Error("Only one Harness node may be active at a time.");
-    }
-    const now = Date.now();
-    node.status = "starting";
-    node.startedAt = now;
-    persistRunNode(node);
-    run.status = "running";
-    run.currentStageId = node.id;
-    persistRun(run);
-
-    const parent = await bb.sdk.threads.get({ threadId: run.parentThreadId });
-    const environmentId = run.taskPacket.environmentId;
-    if (!environmentId) {
-      node.status = "failed";
-      persistRunNode(node);
-      throw new Error("This Harness run has no frozen environment; cannot spawn a child.");
-    }
-    const nodes = runNodesOf(run.id);
-    const choice = resolvedRunChoice(nodes, node, run.taskPacket);
-    if (choice) {
-      applyNodeRouting(node, choice);
-      persistRunNode(node);
-    }
-    const prior = priorPacketsForRole(node.role, packetHistory(run.id));
-    const prompt = buildRolePrompt({
-      role: node.role,
-      node,
-      taskPacket: run.taskPacket,
-      priorPackets: prior,
-    });
-    const title = `${ROLE_TITLE[node.role]}: ${node.templateNodeKey}`.slice(0, 80);
-    try {
-      const child = await bb.sdk.threads.spawn({
-        prompt,
-        parentThreadId: parent.id,
-        projectId: parent.projectId,
-        title,
-        visibility: "visible",
-        origin: "plugin",
-        environment: { type: "reuse", environmentId },
-        ...(choice
-          ? {
-              providerId: choice.providerId,
-              model: choice.model,
-              reasoningLevel: choice.reasoningLevel,
-              ...(choice.serviceTier ? { serviceTier: choice.serviceTier } : {}),
-              executionInputSources: {
-                providerId: "explicit" as const,
-                model: "explicit" as const,
-                reasoningLevel: "explicit" as const,
-                ...(choice.serviceTier ? { serviceTier: "explicit" as const } : {}),
-              },
-            }
-          : {}),
-      });
-      node.childThreadId = child.id;
-      node.status = "in_progress";
-      persistRunNode(node);
-    } catch (error) {
-      node.status = "failed";
-      persistRunNode(node);
-      throw error;
-    }
-    publish();
-  }
-
-  async function startReadyNode(run: HarnessRun): Promise<void> {
-    const next = firstReadyNode(runNodesOf(run.id));
-    if (!next) return;
-    await spawnRunNode(run, next);
-  }
-
-  function applyIntent(
-    run: HarnessRun,
-    nodes: HarnessRunNode[],
-    intent: ReturnType<typeof intentAfterPacket>,
-  ): { startKey: string | null } {
-    if (intent.type === "await_plan_approval") {
-      run.status = "awaiting_plan_approval";
-      persistRun(run);
-      return { startKey: null };
-    }
-    if (intent.type === "await_correction_approval") {
-      run.status = "awaiting_correction_approval";
-      persistRun(run);
-      return { startKey: null };
-    }
-    if (intent.type === "complete") {
-      run.status = "completed";
-      run.completedAt = Date.now();
-      persistRun(run);
-      return { startKey: null };
-    }
-    if (intent.type === "blocked") {
-      run.status = "blocked";
-      run.completedAt = Date.now();
-      persistRun(run);
-      return { startKey: null };
-    }
-    if (intent.type === "start_node") {
-      return { startKey: intent.templateNodeKey };
-    }
-    persistRun(run);
-    return { startKey: null };
-  }
-
-  async function startRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
-    const parent = await bb.sdk.threads.get({ threadId: input.threadId });
-    const projectId = input.projectId ?? parent.projectId;
-    if (selectLiveRun.get(input.threadId)) {
-      throw new Error("A Harness run is already active on this thread.");
-    }
-    if (!parent.environmentId) {
-      throw new Error("Parent thread has no environment; cannot start a Harness run.");
-    }
-    const now = Date.now();
-    const taskPacket: TaskPacket = {
-      objective: input.objective.trim(),
-      branch: input.branch?.trim() || null,
-      execPlanPath: input.execPlanPath?.trim() || null,
-      protectedPaths: input.protectedPaths ?? [],
-      runScout: input.runScout !== false,
-      specialistQuestion: input.specialistQuestion?.trim() || null,
-      routingOverrides: input.routingOverrides ?? { ...currentRouting },
-      projectId,
-      parentThreadId: input.threadId,
-      environmentId: parent.environmentId,
-      promptVersion: PROMPT_VERSION,
-      schemaVersion: SCHEMA_VERSION,
-    };
-    const runId = randomUUID();
-    const templates = milestonePipelineNodes({
-      runScout: taskPacket.runScout,
-      specialistQuestion: taskPacket.specialistQuestion,
-    });
-    const insertAll = db.transaction(() => {
-      insertRun.run({
-        id: runId,
-        project_id: projectId,
-        parent_thread_id: input.threadId,
-        template_id: MILESTONE_PIPELINE_ID,
-        status: "running",
-        current_stage_id: null,
-        task_packet_json: JSON.stringify(taskPacket),
-        correction_count: 0,
-        created_at: now,
-        updated_at: now,
-        completed_at: null,
-      });
-      for (const [index, template] of templates.entries()) {
-        insertRunNode.run({
-          id: randomUUID(),
-          run_id: runId,
-          template_node_key: template.key,
-          role: template.role,
-          phase: template.phase,
-          ordinal: index,
-          status: template.skip ? "skipped" : "pending",
-          deps: JSON.stringify(template.deps),
-          child_thread_id: null,
-          provider_id: null,
-          model: null,
-          reasoning_level: null,
-          service_tier: null,
-          started_at: null,
-          completed_at: template.skip ? now : null,
-          packet_version: 1,
-        });
-      }
-    });
-    try {
-      insertAll();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (message.includes("harness_runs_one_live") || message.includes("UNIQUE")) {
-        throw new Error("A Harness run is already active on this thread.");
-      }
-      throw error;
-    }
-    const run = toRun(selectRun.get(runId) as RunRow);
-    if (input.nodeRouting) {
-      for (const node of runNodesOf(run.id)) {
-        const choice = input.nodeRouting[node.templateNodeKey];
-        if (!choice) continue;
-        applyNodeRouting(node, choice);
-        persistRunNode(node);
-      }
-    }
-    try {
-      await startReadyNode(run);
-    } catch (error) {
-      publish();
-      throw error;
-    }
-    publish();
-  }
-
-  async function stopRun(threadId: string): Promise<void> {
-    const run = latestRunFor(threadId);
-    if (!run) throw new Error("No Harness run on this thread.");
-    if (isTerminalRunStatus(run.status)) return;
-    run.status = "cancelled";
-    run.completedAt = Date.now();
-    persistRun(run);
-    for (const node of runNodesOf(run.id)) {
-      if (node.status === "in_progress" || node.status === "starting") {
-        node.status = "failed";
-        node.completedAt = Date.now();
-        persistRunNode(node);
-        if (node.childThreadId) {
-          try {
-            await bb.sdk.threads.stop({ threadId: node.childThreadId });
-          } catch {
-            // Child stop is best-effort; the run is already terminal.
-          }
-        }
-      }
-    }
-    publish();
-  }
-
-  async function approvePlan(threadId: string): Promise<void> {
-    const run = requireLiveRun(threadId);
-    if (!canApprovePlan(run)) {
-      throw new Error("This run is not awaiting plan approval.");
-    }
-    run.status = "running";
-    persistRun(run);
-    await startReadyNode(run);
-    publish();
-  }
-
-  async function approveCorrection(threadId: string): Promise<void> {
-    const run = requireLiveRun(threadId);
-    if (!canApproveCorrection(run)) {
-      throw new Error("This run cannot start a correction pass.");
-    }
-    const existing = runNodesOf(run.id);
-    if (existing.some((node) => node.templateNodeKey === "worker_correction")) {
-      throw new Error("A correction pass already exists on this run.");
-    }
-    const now = Date.now();
-    const extras = correctionNodes();
-    const startOrdinal = existing.length;
-    db.transaction(() => {
-      for (const [index, template] of extras.entries()) {
-        insertRunNode.run({
-          id: randomUUID(),
-          run_id: run.id,
-          template_node_key: template.key,
-          role: template.role,
-          phase: template.phase,
-          ordinal: startOrdinal + index,
-          status: "pending",
-          deps: JSON.stringify(template.deps),
-          child_thread_id: null,
-          provider_id: null,
-          model: null,
-          reasoning_level: null,
-          service_tier: null,
-          started_at: null,
-          completed_at: null,
-          packet_version: 1,
-        });
-      }
-      const promote = existing.find((node) => node.templateNodeKey === "promote");
-      if (promote) {
-        promote.deps = ["reviewer_final"];
-        persistRunNode(promote);
-      }
-      run.correctionCount = 1;
-      run.status = "running";
-      persistRun(run);
-    })();
-    await startReadyNode(toRun(selectRun.get(run.id) as RunRow));
-    publish();
-  }
-
-  async function retryStage(threadId: string, nodeId?: string): Promise<void> {
-    const run = requireLiveRun(threadId);
-    const nodes = runNodesOf(run.id);
-    const node = nodeId
-      ? nodes.find((candidate) => candidate.id === nodeId)
-      : nodes.find((candidate) => candidate.status === "failed");
-    if (!node) throw new Error("No failed stage to retry.");
-    if (!canRetryNode(run, node)) {
-      throw new Error(`Node ${node.templateNodeKey} cannot be retried.`);
-    }
-    node.status = "pending";
-    node.childThreadId = null;
-    node.startedAt = null;
-    node.completedAt = null;
-    node.packetVersion += 1;
-    persistRunNode(node);
-    run.status = "running";
-    persistRun(run);
-    await spawnRunNode(run, node);
-    publish();
-  }
-
-  function setRunNodeRouting(threadId: string, nodeId: string, choice: ExecutionChoice | null): void {
-    const run = requireLiveRun(threadId);
-    const node = runNodesOf(run.id).find((candidate) => candidate.id === nodeId);
-    if (!node) throw new Error(`No run node ${nodeId}.`);
-    if (node.status !== "pending" && node.status !== "failed") {
-      throw new Error(`Node ${node.templateNodeKey} can only override routing while pending or failed.`);
-    }
-    applyNodeRouting(node, choice);
-    persistRunNode(node);
-    publish();
-  }
-
-  function failActiveChildWithoutPacket(childThreadId: string): void {
-    const row = selectRunNodeByChild.get(childThreadId) as RunNodeRow | undefined;
-    if (!row) return;
-    const runRow = selectRun.get(row.run_id) as RunRow | undefined;
-    if (!runRow || !isLiveRunStatus(runRow.status)) return;
-    const node = toRunNode(row);
-    if (node.status !== "in_progress" && node.status !== "starting") return;
-    if (selectPacketForNodeVersion.get(node.id, node.packetVersion)) return;
-    node.status = "failed";
-    node.completedAt = Date.now();
-    persistRunNode(node);
-    const run = toRun(runRow);
-    run.currentStageId = node.id;
-    persistRun(run);
-  }
-
-  async function submitRunPacket(args: {
-    threadId: string;
-    role: string;
-    kind: string;
-    payload: unknown;
-  }): Promise<string> {
-    const row = selectRunNodeByChild.get(args.threadId) as RunNodeRow | undefined;
-    if (!row) {
-      throw new Error("This thread is not a Harness role child.");
-    }
-    const run = toRun(selectRun.get(row.run_id) as RunRow);
-    if (!isLiveRunStatus(run.status) && run.status !== "awaiting_plan_approval") {
-      throw new Error("This Harness run is not accepting packets.");
-    }
-    const node = toRunNode(row);
-    if (node.status !== "in_progress") {
-      throw new Error(`Node ${node.templateNodeKey} is ${node.status} and cannot submit.`);
-    }
-    if (args.role !== node.role) {
-      throw new Error(`Role mismatch: node is ${node.role}, submission is ${args.role}`);
-    }
-    const validated = validateRolePacket(node.role, args.kind, args.payload);
-    if (!validated.ok) throw new Error(validated.error);
-    if (selectPacketForNodeVersion.get(node.id, node.packetVersion)) {
-      throw new Error("A packet was already submitted for this stage.");
-    }
-    const now = Date.now();
-    insertPacket.run({
-      id: randomUUID(),
-      run_id: run.id,
-      run_node_id: node.id,
-      kind: validated.kind,
-      version: node.packetVersion,
-      payload_json: JSON.stringify(validated.payload),
-      created_at: now,
-    });
-    node.status = "done";
-    node.completedAt = now;
-    persistRunNode(node);
-    const nodes = runNodesOf(run.id);
-    const intent = intentAfterPacket({
-      run,
-      nodes,
-      completed: node,
-      payload: validated.payload,
-    });
-    const { startKey } = applyIntent(run, nodes, intent);
-    if (startKey) {
-      const next = nodes.find((candidate) => candidate.templateNodeKey === startKey);
-      if (next) await spawnRunNode(toRun(selectRun.get(run.id) as RunRow), next);
-    }
-    publish();
-    return JSON.stringify({
-      accepted: true,
-      kind: validated.kind,
-      runStatus: toRun(selectRun.get(run.id) as RunRow).status,
-    });
-  }
-
   function nodesOf(planId: string): PlanNode[] {
     return (selectNodes.all(planId) as NodeRow[]).map(toNode);
+  }
+
+  function snapshotOf(row: PlanRow): HarnessDefinition | null {
+    if (!row.harness_snapshot) return null;
+    try {
+      return parseHarnessDefinition(JSON.parse(row.harness_snapshot));
+    } catch {
+      return null;
+    }
+  }
+
+  function correctionCountOf(row: PlanRow): number {
+    return typeof row.correction_count === "number" ? row.correction_count : 0;
+  }
+
+  function criticBlockedOf(row: PlanRow): boolean {
+    return row.critic_blocked === 1;
   }
 
   function toMeta(row: PlanRow, nodes = nodesOf(row.id)) {
@@ -1380,10 +968,66 @@ export default async function plugin(bb: BbPluginApi) {
       updatedAt: row.updated_at,
       nodeCount: nodes.length,
       doneCount: nodes.filter((node) => node.status === "done").length,
+      harnessId: row.harness_id ?? null,
+      correctionCount: correctionCountOf(row),
+      criticBlocked: criticBlockedOf(row),
     };
   }
 
-  async function enrichNodes(nodes: PlanNode[]): Promise<z.infer<typeof planNodeSchema>[]> {
+  function resultDto(row: ResultRow | undefined) {
+    if (!row) return null;
+    return {
+      verdict: (row.verdict as CriticVerdict | null) ?? null,
+      summary: row.summary,
+      artifactPaths: parseDeps(row.artifact_paths),
+      actor: row.actor,
+      source: row.source,
+      createdAt: row.created_at,
+    };
+  }
+
+  function attemptDto(row: AttemptRow | undefined) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      childThreadId: row.child_thread_id,
+      providerId: row.provider_id,
+      model: row.model,
+      startedAt: row.started_at,
+      endedAt: row.ended_at,
+      durationMs: row.duration_ms,
+      tokens: tokensFromAttempt(row),
+      source: row.source,
+    };
+  }
+
+  function planTotals(planId: string) {
+    const attempts = selectAttemptsForPlan.all(planId) as AttemptRow[];
+    let duration: number | null = null;
+    let tokens = emptyTokenCounters();
+    for (const attempt of attempts) {
+      tokens = addTokenCounters(tokens, tokensFromAttempt(attempt));
+      if (attempt.duration_ms != null) {
+        duration = (duration ?? 0) + attempt.duration_ms;
+      }
+    }
+    return { durationMs: duration, tokens };
+  }
+
+  async function enrichNodes(
+    planId: string,
+    nodes: PlanNode[],
+  ): Promise<z.infer<typeof planNodeSchema>[]> {
+    const attemptsByNode = new Map<string, AttemptRow[]>();
+    for (const item of selectAttemptsForPlan.all(planId) as AttemptRow[]) {
+      const list = attemptsByNode.get(item.node_id) ?? [];
+      list.push(item);
+      attemptsByNode.set(item.node_id, list);
+    }
+    const latestResults = new Map<string, ResultRow>();
+    for (const item of selectResultsForPlan.all(planId) as ResultRow[]) {
+      latestResults.set(item.node_id, item);
+    }
     return Promise.all(
       nodes.map(async (node) => {
         const base = {
@@ -1399,7 +1043,12 @@ export default async function plugin(bb: BbPluginApi) {
           model: node.model ?? null,
           reasoningLevel: node.reasoningLevel ?? null,
           serviceTier: node.serviceTier ?? null,
+          execution: (node.execution ?? (nodeSpawnsChild(node) ? "child" : "parent")) as ExecutionMode,
+          skills: node.skills ?? [],
           child: null as z.infer<typeof childThreadSchema> | null,
+          result: resultDto(latestResults.get(node.id)),
+          attempt: attemptDto((attemptsByNode.get(node.id) ?? []).at(-1)),
+          attempts: (attemptsByNode.get(node.id) ?? []).map((row) => attemptDto(row)!),
         };
         if (!node.childThreadId) return base;
         try {
@@ -1430,7 +1079,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function toFull(row: PlanRow) {
     const nodes = nodesOf(row.id);
-    return { ...toMeta(row, nodes), nodes: await enrichNodes(nodes) };
+    const snapshot = snapshotOf(row);
+    return {
+      ...toMeta(row, nodes),
+      nodes: await enrichNodes(row.id, nodes),
+      harnessSnapshot: snapshot,
+      totals: planTotals(row.id),
+      skillWarnings: [] as string[],
+    };
   }
 
   function requirePlan(id: string): PlanRow {
@@ -1439,19 +1095,78 @@ export default async function plugin(bb: BbPluginApi) {
     return row;
   }
 
-  function planForThread(projectId: string, threadId: string): PlanRow | null {
-    return (
-      (selectPlansForThread.get(projectId, threadId) as PlanRow | undefined) ??
-      null
-    );
+  async function requireParentPlan(
+    planId: string,
+    threadId: string | undefined,
+    claimedProjectId: string | undefined,
+    mode: "read" | "mutate",
+  ): Promise<PlanRow> {
+    if (!threadId) {
+      throw new Error("Plan operations require the owning parent thread.");
+    }
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (claimedProjectId && claimedProjectId !== thread.projectId) {
+      throw new Error(`projectId ${claimedProjectId} does not match thread ${threadId}.`);
+    }
+    const plan = requirePlan(planId);
+    if (plan.thread_id === thread.id && plan.project_id === thread.projectId) {
+      return plan;
+    }
+    if (mode === "mutate") {
+      const mapped = selectNodeByChild.get(threadId) as NodeRow | undefined;
+      if (mapped && mapped.plan_id === plan.id) {
+        throw new Error(
+          "Child threads cannot complete, skip, or rework Harness nodes. The parent operator owns those actions.",
+        );
+      }
+    }
+    throw new Error("This plan does not belong to this project or thread.");
+  }
+
+  function liveCandidatePlans(arc: ArcRow): PlanRow[] {
+    return (selectPlansForThread.all(arc.project_id, arc.thread_id) as PlanRow[])
+      .slice()
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .filter((row) =>
+        nodesOf(row.id).some(
+          (node) => node.status === "in_progress" || node.status === "starting",
+        ),
+      );
+  }
+
+  function activePlanForArc(arc: ArcRow): PlanRow | null {
+    if (arc.plan_id) {
+      const bound = selectPlan.get(arc.plan_id) as PlanRow | undefined;
+      if (
+        bound &&
+        bound.thread_id === arc.thread_id &&
+        bound.project_id === arc.project_id
+      ) {
+        return bound;
+      }
+      return null;
+    }
+    const rows = selectPlansForThread.all(arc.project_id, arc.thread_id) as PlanRow[];
+    if (rows.length === 1) {
+      const only = rows[0]!;
+      bindArcPlanId.run(only.id, arc.thread_id);
+      arc.plan_id = only.id;
+      return only;
+    }
+    const live = liveCandidatePlans(arc);
+    return live.length === 1 ? live[0]! : null;
   }
 
   async function resolveProjectId(
     threadId: string,
-    fallback?: string,
+    claimed?: string,
   ): Promise<string> {
-    if (fallback) return fallback;
     const thread = await bb.sdk.threads.get({ threadId });
+    if (claimed && claimed !== thread.projectId) {
+      throw new Error(
+        `projectId ${claimed} does not match thread ${threadId}.`,
+      );
+    }
     return thread.projectId;
   }
 
@@ -1467,10 +1182,21 @@ export default async function plugin(bb: BbPluginApi) {
     return existing;
   }
 
-  function assertNoLiveRun(threadId: string): void {
-    if (liveRunFor(threadId)) {
-      throw new Error("This thread has an active Harness run. Use start/stop/approve/retry instead of phase advance.");
+  function historicalLiveRun(threadId: string): { id: string } | null {
+    const liveStatuses = new Set([
+      "configuring",
+      "running",
+      "awaiting_plan_approval",
+      "awaiting_correction_approval",
+    ]);
+    const byChild = selectHistoricalRunNodeByChild.get(threadId) as { run_id: string } | undefined;
+    if (byChild) {
+      const row = db.prepare("SELECT * FROM harness_runs WHERE id = ?").get(byChild.run_id) as
+        | { id: string; status: string }
+        | undefined;
+      if (row && liveStatuses.has(row.status)) return { id: row.id };
     }
+    return (selectHistoricalLiveRun.get(threadId) as { id: string } | undefined) ?? null;
   }
 
   function writeArc(
@@ -1478,13 +1204,17 @@ export default async function plugin(bb: BbPluginApi) {
     projectId: string,
     phase: Phase,
     note = "",
+    harnessId: string | null = null,
   ): ArcRow {
+    const existing = readArc(threadId);
     const row: ArcRow = {
       thread_id: threadId,
       project_id: projectId,
       phase,
       note,
       updated_at: Date.now(),
+      harness_id: harnessId ?? existing?.harness_id ?? STANDARD_HARNESS_ID,
+      plan_id: existing?.plan_id ?? null,
     };
     upsertArc.run(row);
     publish();
@@ -1502,11 +1232,6 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function ownerThreadId(threadId: string): string {
-    const runChild = selectRunNodeByChild.get(threadId) as RunNodeRow | undefined;
-    if (runChild) {
-      const run = selectRun.get(runChild.run_id) as RunRow | undefined;
-      return run?.parent_thread_id || threadId;
-    }
     const childRow = selectNodeByChild.get(threadId) as NodeRow | undefined;
     if (!childRow) return threadId;
     const plan = selectPlan.get(childRow.plan_id) as PlanRow | undefined;
@@ -1523,13 +1248,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function statusPayload(threadId: string, projectId: string) {
     const ownerId = ownerThreadId(threadId);
-    const run = latestRunFor(ownerId);
     const existingArc = readArc(ownerId);
-    const phase = run
-      ? phaseFromRun(run)
-      : existingArc && isPhase(existingArc.phase)
-        ? existingArc.phase
-        : "explore";
+    const phase = existingArc && isPhase(existingArc.phase) ? existingArc.phase : "explore";
     const arc = existingArc
       ? { ...toArcDto(existingArc), phase }
       : {
@@ -1539,8 +1259,14 @@ export default async function plugin(bb: BbPluginApi) {
           note: "",
           updatedAt: 0,
         };
-    const planRow = planForThread(projectId, ownerId);
+    const planRow = existingArc ? activePlanForArc(existingArc) : null;
     const plan = planRow ? await toFull(planRow) : null;
+    const snapshot = planRow ? snapshotOf(planRow) : null;
+    const harnessId = existingArc?.harness_id ?? snapshot?.id ?? null;
+    const harnessDef = harnessId
+      ? findHarness(harnessId, snapshot) ?? snapshot ?? null
+      : null;
+    const harness = existingArc ? (harnessDef ? toHarnessRef(harnessDef) : null) : null;
     const nextNode = plan ? nextWorkNode(plan.nodes) : null;
     const workerIndex =
       nextNode && plan ? workerOrdinal(plan.nodes, nextNode.id) : 0;
@@ -1558,7 +1284,8 @@ export default async function plugin(bb: BbPluginApi) {
       frontierModel: currentSettings.frontierModel,
       prewalkEnabled: currentSettings.prewalkEnabled,
       routing: currentRouting,
-      run: run ? await toRunDetails(run) : null,
+      harness,
+      customHarnesses,
     };
   }
 
@@ -1569,16 +1296,235 @@ export default async function plugin(bb: BbPluginApi) {
       copy.summary,
       "Work this node only. Do not plan, implement, and critique in the same pass.",
       "Keep auditable outputs in artifacts/.",
+      phase === "critic"
+        ? "When finished, stop. The parent operator records APPROVE, REWORK, or BLOCK and a short summary. Do not complete or rework this node yourself."
+        : "When you finish, stop. The parent operator marks the node Done after review. Do not complete this node yourself.",
       "",
       `Node id: ${node.id}`,
       `Title: ${node.title}`,
       node.detail ? `Detail: ${node.detail}` : null,
-      "",
-      "When you finish, stop. The parent operator marks the node Done after review.",
       "Do not start the next DAG node.",
     ]
       .filter((line): line is string => line !== null)
       .join("\n");
+  }
+
+  async function readChildTokens(threadId: string): Promise<TokenCounters | null> {
+    try {
+      const events = await bb.sdk.threads.events.list({
+        threadId,
+        types: ["thread/tokenUsage/updated"],
+        order: "desc",
+        limit: "20",
+      });
+      for (const event of events) {
+        const parsed = parseTokenUsageEvent(event);
+        if (parsed) return parsed;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  async function stopChildThread(threadId: string, label: string): Promise<void> {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+      await closeAttemptForChild(threadId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Cannot ${label}: failed to stop child ${threadId}. ${reason}`);
+    }
+  }
+
+  async function stopLiveChildren(
+    nodes: PlanNode[],
+    label: string,
+    predicate: (node: PlanNode) => boolean = () => true,
+  ): Promise<PlanNode[]> {
+    const live = nodes.filter(
+      (node) =>
+        (node.status === "in_progress" || node.status === "starting") &&
+        node.childThreadId &&
+        predicate(node),
+    );
+    for (const node of live) {
+      await stopChildThread(node.childThreadId!, label);
+    }
+    return live;
+  }
+
+  async function closeAttemptForChild(childThreadId: string): Promise<void> {
+    const open = selectOpenAttemptByChild.get(childThreadId) as AttemptRow | undefined;
+    if (!open) return;
+    const endedAt = Date.now();
+    const tokens = (await readChildTokens(childThreadId)) ?? emptyTokenCounters();
+    updateAttempt.run({
+      id: open.id,
+      ended_at: endedAt,
+      duration_ms: durationMs(open.started_at, endedAt),
+      tokens_input: tokens.input,
+      tokens_cached: tokens.cached,
+      tokens_output: tokens.output,
+      tokens_reasoning: tokens.reasoning,
+      tokens_total: tokens.total,
+    });
+  }
+
+  async function resolveWorkspace(threadId: string) {
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (!thread.environmentId) {
+      throw new Error("This thread has no environment to initialize.");
+    }
+    const environment = await bb.sdk.environments.get({
+      environmentId: thread.environmentId,
+    });
+    if (!environment.path) {
+      throw new Error("Environment has no workspace path.");
+    }
+    return {
+      hostId: environment.hostId,
+      path: environment.path,
+      projectId: thread.projectId,
+      environmentId: thread.environmentId,
+    };
+  }
+
+  async function ensureArtifactDir(threadId: string, planId: string, required: boolean): Promise<void> {
+    try {
+      const { hostId, path } = await resolveWorkspace(threadId);
+      await bb.sdk.files.mkdir({
+        hostId,
+        path: `${path}/${artifactDirForPlan(planId)}`,
+        rootPath: path,
+        recursive: true,
+      });
+    } catch (error) {
+      if (required) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`Required artifact workspace is unavailable. ${reason}`);
+      }
+    }
+  }
+
+  async function writeManifest(threadId: string, planId: string): Promise<void> {
+    const plan = selectPlan.get(planId) as PlanRow | undefined;
+    if (!plan?.thread_id) return;
+    try {
+      const { hostId, path } = await resolveWorkspace(threadId);
+      const full = await toFull(plan);
+      const payload = {
+        planId,
+        harnessId: plan.harness_id,
+        correctionCount: correctionCountOf(plan),
+        criticBlocked: criticBlockedOf(plan),
+        nodes: full.nodes.map((node) => ({
+          id: node.id,
+          phase: node.phase,
+          status: node.status,
+          result: node.result,
+          artifacts: node.result?.artifactPaths ?? [],
+        })),
+        totals: full.totals,
+        updatedAt: Date.now(),
+      };
+      await bb.sdk.files.write({
+        hostId,
+        path: `${path}/${artifactManifestPath(planId)}`,
+        rootPath: path,
+        content: `${JSON.stringify(payload, null, 2)}\n`,
+        createParents: true,
+      });
+    } catch {
+      // Manifest is a readable export; DB remains authoritative.
+    }
+  }
+
+  function recordOutcome(args: {
+    planId: string;
+    nodeId: string;
+    verdict: CriticVerdict | null;
+    summary: string | null;
+    artifactPaths: string[];
+    actor: string;
+    source: string;
+  }): void {
+    const now = Date.now();
+    insertResult.run({
+      id: randomUUID(),
+      plan_id: args.planId,
+      node_id: args.nodeId,
+      verdict: args.verdict,
+      summary: args.summary,
+      artifact_paths: JSON.stringify(args.artifactPaths),
+      actor: args.actor,
+      source: args.source,
+      created_at: now,
+    });
+    for (const path of args.artifactPaths) {
+      insertArtifact.run({
+        id: randomUUID(),
+        plan_id: args.planId,
+        node_id: args.nodeId,
+        path,
+        created_at: now,
+      });
+    }
+  }
+
+  const threadLifecycleTails = new Map<string, Promise<unknown>>();
+
+  async function withThreadLifecycle<T>(threadId: string, work: () => Promise<T>): Promise<T> {
+    const previous = threadLifecycleTails.get(threadId) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const mine = previous.catch(() => undefined).then(() => held);
+    threadLifecycleTails.set(threadId, mine);
+    try {
+      await previous.catch(() => undefined);
+      return await work();
+    } finally {
+      release();
+      if (threadLifecycleTails.get(threadId) === mine) {
+        threadLifecycleTails.delete(threadId);
+      }
+    }
+  }
+
+  function assertActiveHarnessPlan(plan: PlanRow, threadId: string): void {
+    const arc = readArc(threadId);
+    if (!arc) {
+      throw new Error("No active Harness run on this thread.");
+    }
+    const current = activePlanForArc(arc);
+    if (!current || current.id !== plan.id) {
+      throw new Error("This plan is not the active Harness run on this thread.");
+    }
+  }
+
+  async function inheritedAttemptRouting(
+    parentThreadId: string,
+    parentProviderId: string,
+  ): Promise<{
+    providerId: string | null;
+    model: string | null;
+    source: string;
+  }> {
+    try {
+      const options = await bb.sdk.threads.defaultExecutionOptions({ threadId: parentThreadId });
+      if (options?.model) {
+        return {
+          providerId: parentProviderId,
+          model: options.model,
+          source: "thread/defaultExecutionOptions",
+        };
+      }
+    } catch {
+      // Missing defaults stay unknown. Do not invent a model id.
+    }
+    return { providerId: null, model: null, source: "inherited-unknown" };
   }
 
   async function startPlanNode(
@@ -1586,12 +1532,24 @@ export default async function plugin(bb: BbPluginApi) {
     nodeId: string,
     parentThreadId?: string,
   ) {
+    const ownerId = requirePlan(planId).thread_id ?? parentThreadId;
+    if (!ownerId) {
+      throw new Error("Need a parent thread to execute this node.");
+    }
+    return withThreadLifecycle(ownerId, () => startPlanNodeLocked(planId, nodeId, ownerId));
+  }
+
+  async function startPlanNodeLocked(
+    planId: string,
+    nodeId: string,
+    parentThreadId: string,
+  ) {
     const plan = requirePlan(planId);
+    assertActiveHarnessPlan(plan, parentThreadId);
+    const node = lookupPlanNode(planId, nodeId);
     const nodes = nodesOf(planId);
-    const node = nodes.find((candidate) => candidate.id === nodeId);
-    if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
     const inflight = activeNode(nodes);
-    if (inflight && inflight.id !== nodeId) {
+    if (inflight && inflight.id !== node.id) {
       throw new Error(
         `Node ${inflight.id} is already in progress. Complete it before starting another.`,
       );
@@ -1601,37 +1559,59 @@ export default async function plugin(bb: BbPluginApi) {
       return parent && parent.status !== "done" && parent.status !== "skipped";
     });
     if (blocked.length > 0) {
-      throw new Error(`Node ${nodeId} is blocked by: ${blocked.join(", ")}`);
+      throw new Error(`Node ${node.id} is blocked by: ${blocked.join(", ")}`);
     }
     if (node.status === "done" || node.status === "skipped") {
-      throw new Error(`Node ${nodeId} is ${node.status} and cannot start.`);
+      throw new Error(`Node ${node.id} is ${node.status} and cannot start.`);
     }
-    if (node.status === "in_progress" && node.childThreadId) {
+    if (node.phase === "promote" && criticBlockedOf(plan)) {
+      throw new Error("Promote is blocked until the operator resets the Critic BLOCK.");
+    }
+    if (node.status === "in_progress" || node.status === "starting") {
       return { plan: await toFull(plan) };
     }
 
-    updateNodeStatus.run("in_progress", nodeId, planId);
+    const spawns = nodeSpawnsChild(node);
+    // Claim before any await so a concurrent Start cannot spawn a second child.
+    const claimed = claimNodeStatus.run(
+      spawns ? "starting" : "in_progress",
+      node.id,
+      planId,
+      "pending",
+    );
+    if (claimed.changes !== 1) {
+      return { plan: await toFull(requirePlan(planId)) };
+    }
     touchPlan.run(Date.now(), planId);
 
-    if (!isSpawnablePhase(node.phase)) {
+    if (!spawns) {
       publish();
-      return { plan: await toFull(plan) };
+      return { plan: await toFull(requirePlan(planId)) };
     }
 
+    const recoverClaim = () => {
+      recoverStartingNode.run(node.id, planId);
+    };
     const parentId = plan.thread_id ?? parentThreadId;
-    if (!parentId) {
-      updateNodeStatus.run("pending", nodeId, planId);
-      throw new Error("Need a parent thread to spawn a worker/critic/promote child.");
-    }
-    const parent = await bb.sdk.threads.get({ threadId: parentId });
-    if (!parent.environmentId) {
-      updateNodeStatus.run("pending", nodeId, planId);
-      throw new Error("Parent thread has no environment; cannot spawn a child.");
-    }
 
-    const choice = resolvedChoice(nodes, node);
-    const title = `${PHASE_COPY[node.phase].label}: ${node.title}`.slice(0, 80);
+    let spawnedId: string | null = null;
     try {
+      const parent = await bb.sdk.threads.get({ threadId: parentId });
+      if (!parent.environmentId) {
+        recoverClaim();
+        throw new Error("Parent thread has no environment; cannot spawn a child.");
+      }
+      const choice = resolvedChoice(nodes, node);
+      // Routing must be resolved before spawn so attach can run with no await
+      // between the spawn result and the child row.
+      const routing = choice
+        ? {
+            providerId: choice.providerId,
+            model: choice.model,
+            source: "explicit-routing",
+          }
+        : await inheritedAttemptRouting(parent.id, parent.providerId);
+      const title = `${PHASE_COPY[node.phase].label}: ${node.title}`.slice(0, 80);
       const child = await bb.sdk.threads.spawn({
         prompt: nodePrompt(node, node.phase),
         parentThreadId: parent.id,
@@ -1659,13 +1639,50 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : {}),
       });
-      updateNodeChild.run(child.id, nodeId, planId);
+      spawnedId = child.id;
+      const attached = db.transaction(() => {
+        const result = attachStartingChild.run(child.id, node.id, planId);
+        if (result.changes !== 1) return false;
+        const now = Date.now();
+        insertAttempt.run({
+          id: randomUUID(),
+          plan_id: planId,
+          node_id: node.id,
+          child_thread_id: child.id,
+          provider_id: routing.providerId,
+          model: routing.model,
+          started_at: now,
+          ended_at: null,
+          duration_ms: null,
+          tokens_input: null,
+          tokens_cached: null,
+          tokens_output: null,
+          tokens_reasoning: null,
+          tokens_total: null,
+          source: routing.source,
+          created_at: now,
+        });
+        return true;
+      })();
+      if (!attached) {
+        throw new Error("Node start claim was lost before the child could be attached.");
+      }
     } catch (error) {
-      updateNodeStatus.run("pending", nodeId, planId);
+      recoverClaim();
+      if (spawnedId) {
+        try {
+          await bb.sdk.threads.stop({ threadId: spawnedId });
+        } catch (stopError) {
+          const reason = stopError instanceof Error ? stopError.message : String(stopError);
+          throw new Error(
+            `Child ${spawnedId} was spawned but not attached and could not be stopped. ${reason}`,
+          );
+        }
+      }
       throw error;
     }
     publish();
-    return { plan: await toFull(plan) };
+    return { plan: await toFull(requirePlan(planId)) };
   }
 
   async function firstAvailableChoice(): Promise<ExecutionChoice> {
@@ -1693,58 +1710,318 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  function insertSeedNodes(planId: string): void {
-    for (const [index, node] of seedArcNodes().entries()) {
+  function insertSeedNodes(planId: string, definition?: HarnessDefinition): void {
+    const source = definition ?? standardHarnessDefinition();
+    for (const [index, node] of seedNodesFromDefinition(planId, source).entries()) {
       insertNode.run({
         id: node.id,
         plan_id: planId,
         title: node.title,
         detail: node.detail,
         phase: node.phase,
-        status: "pending",
+        status: node.status ?? "pending",
         deps: JSON.stringify(node.deps),
         sort_order: index,
+        execution: node.execution,
+        skills: JSON.stringify([]),
       });
     }
   }
 
+  function persistPlanSnapshot(planId: string, definition: HarnessDefinition): void {
+    updatePlanSnapshot.run(
+      definition.id,
+      JSON.stringify(snapshotHarness(definition)),
+      Date.now(),
+      planId,
+    );
+  }
+
   function uniqueNodeId(planId: string, title: string): string {
-    const existing = new Set(nodesOf(planId).map((node) => node.id));
-    const base = slugId(title);
-    if (!existing.has(base)) return base;
-    let id = `${base}-${shortId()}`;
-    while (existing.has(id)) id = `${base}-${shortId()}`;
-    return id;
+    const taken = new Set(
+      (selectAllNodeIds.all() as Array<{ id: string }>).map((row) => row.id),
+    );
+    return namespacedNodeId(planId, title, taken, shortId);
+  }
+
+  function lookupPlanNode(planId: string, nodeId: string): PlanNode {
+    const nodes = nodesOf(planId);
+    const resolved = resolveNodeRef(nodes, nodeId, planId);
+    const node = nodes.find((candidate) => candidate.id === resolved);
+    if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
+    return node;
+  }
+
+  function addPlanNode(args: {
+    planId: string;
+    title: string;
+    detail?: string;
+    phase?: Phase;
+    deps?: string[];
+  }): void {
+    const planId = args.planId;
+    const plan = requirePlan(planId);
+    const snapshot = snapshotOf(plan);
+    const nodes = nodesOf(planId);
+    const id = uniqueNodeId(planId, args.title);
+    const resolvedDeps = resolveDependencyIds(nodes, args.deps ?? [], planId);
+    const phase = args.phase ?? "worker";
+    const spec = snapshot?.phases[phase];
+    const detail = args.detail ?? spec?.detail ?? "";
+    const execution = spec?.execution;
+    const skills: string[] = [];
+    assertNewNodeDeps(nodes, {
+      id,
+      title: args.title,
+      detail,
+      phase,
+      status: "pending",
+      deps: resolvedDeps,
+      sortOrder: nodes.length,
+    });
+    insertNode.run({
+      id,
+      plan_id: planId,
+      title: args.title,
+      detail,
+      phase,
+      status: "pending",
+      deps: JSON.stringify(resolvedDeps),
+      sort_order: nodes.length,
+      execution: execution ?? (nodeSpawnsChild({ phase }) ? "child" : "parent"),
+      skills: JSON.stringify(skills),
+    });
+    touchPlan.run(Date.now(), planId);
+  }
+
+  async function stopInProgressCriticChildren(planId: string): Promise<PlanNode[]> {
+    return stopLiveChildren(nodesOf(planId), "reopen Worker", (node) => node.phase === "critic");
+  }
+
+  async function reopenPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
+    const node = lookupPlanNode(planId, nodeId);
+    if (node.phase !== "worker") {
+      throw new Error("Only Worker nodes can be reopened after Critic.");
+    }
+    if (node.status !== "done") {
+      throw new Error(`Node ${node.id} must be done before it can be reopened.`);
+    }
+    const critics = await stopInProgressCriticChildren(planId);
+    persistWorkerReopen(planId, node.id, critics);
+    return lookupPlanNode(planId, node.id);
+  }
+
+  function persistWorkerReopen(planId: string, workerId: string, critics: PlanNode[]): void {
+    const mutate = db.transaction(() => {
+      resetPlanNode.run("pending", workerId, planId);
+      for (const critic of critics) {
+        updateNodeStatus.run("pending", critic.id, planId);
+      }
+      touchPlan.run(Date.now(), planId);
+    });
+    mutate();
+    publish();
+  }
+
+  async function reopenLastWorker(planId: string): Promise<void> {
+    const workers = nodesOf(planId)
+      .filter((node) => node.phase === "worker" && node.status === "done")
+      .sort((a, b) => a.sortOrder - b.sortOrder);
+    const last = workers[workers.length - 1];
+    if (!last) return;
+    await reopenPlanNode(planId, last.id);
+  }
+
+  function requireArtifactPaths(raw: string[] | undefined): string[] {
+    const parsed = parseArtifactPaths(raw);
+    if (!parsed) {
+      throw new Error(
+        "Artifact refs must be relative paths under artifacts/ with no absolute or parent-directory segments.",
+      );
+    }
+    return parsed;
+  }
+
+  async function completePlanNode(
+    input: z.infer<typeof completeNodeInputSchema>,
+    attribution: { actor: string; source: string },
+  ): Promise<PlanNode> {
+    const plan = requirePlan(input.planId);
+    const node = lookupPlanNode(input.planId, input.nodeId);
+    if (node.status !== "in_progress") {
+      throw new Error(`Node ${node.id} must be in progress to mark done.`);
+    }
+    if (node.phase === "promote" && criticBlockedOf(plan)) {
+      throw new Error("Promote is blocked until the operator resets the Critic BLOCK.");
+    }
+    const snapshot = snapshotOf(plan);
+    const maxCorrections = snapshot?.maxCorrections ?? null;
+    const artifactPaths = requireArtifactPaths(input.artifactPaths);
+    const summary = input.summary?.trim() || null;
+
+    if (node.phase === "critic") {
+      const verdict = input.verdict;
+      if (!verdict) {
+        throw new Error("Critic completion requires verdict APPROVE, REWORK, or BLOCK.");
+      }
+      if (!summary) {
+        throw new Error("Critic completion requires a short summary.");
+      }
+      if (verdict === "REWORK") {
+        if (!canRework(correctionCountOf(plan), maxCorrections)) {
+          throw new Error(
+            `Correction limit reached (${correctionCountOf(plan)}/${maxCorrections}).`,
+          );
+        }
+        const critics = await stopInProgressCriticChildren(input.planId);
+        const workers = nodesOf(input.planId)
+          .filter((item) => item.phase === "worker" && item.status === "done")
+          .sort((a, b) => a.sortOrder - b.sortOrder);
+        const lastWorker = workers[workers.length - 1];
+        const commit = db.transaction(() => {
+          recordOutcome({
+            planId: input.planId,
+            nodeId: node.id,
+            verdict,
+            summary,
+            artifactPaths,
+            actor: attribution.actor,
+            source: attribution.source,
+          });
+          if (lastWorker) resetPlanNode.run("pending", lastWorker.id, input.planId);
+          for (const critic of critics) {
+            updateNodeStatus.run("pending", critic.id, input.planId);
+          }
+          const latest = requirePlan(input.planId);
+          updatePlanFlags.run(correctionCountOf(latest) + 1, latest.critic_blocked, Date.now(), input.planId);
+        });
+        commit();
+        if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
+        publish();
+        return lookupPlanNode(input.planId, node.id);
+      }
+      if (node.childThreadId) {
+        await stopChildThread(node.childThreadId, "complete Critic");
+      }
+      const commit = db.transaction(() => {
+        recordOutcome({
+          planId: input.planId,
+          nodeId: node.id,
+          verdict,
+          summary,
+          artifactPaths,
+          actor: attribution.actor,
+          source: attribution.source,
+        });
+        updateNodeStatus.run("done", node.id, input.planId);
+        const blocked = verdict === "BLOCK" ? 1 : 0;
+        updatePlanFlags.run(correctionCountOf(plan), blocked, Date.now(), input.planId);
+      });
+      commit();
+      if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
+      publish();
+      return lookupPlanNode(input.planId, node.id);
+    }
+
+    if (node.childThreadId) {
+      await stopChildThread(node.childThreadId, "complete this node");
+    }
+    const commit = db.transaction(() => {
+      recordOutcome({
+        planId: input.planId,
+        nodeId: node.id,
+        verdict: null,
+        summary,
+        artifactPaths,
+        actor: attribution.actor,
+        source: attribution.source,
+      });
+      updateNodeStatus.run("done", node.id, input.planId);
+      touchPlan.run(Date.now(), input.planId);
+    });
+    commit();
+    if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
+    publish();
+    return lookupPlanNode(input.planId, node.id);
+  }
+
+  async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
+    const ownerId = requirePlan(planId).thread_id;
+    const skip = async () => {
+      const plan = requirePlan(planId);
+      const node = lookupPlanNode(planId, nodeId);
+      if (
+        (node.status === "starting" || node.status === "in_progress") &&
+        plan.thread_id
+      ) {
+        assertActiveHarnessPlan(plan, plan.thread_id);
+      }
+      if (node.status === "starting") {
+        throw new Error(
+          `Cannot skip ${node.id} while it is starting. Retry after the child is attached.`,
+        );
+      }
+      if (node.status === "in_progress" && node.childThreadId) {
+        await stopChildThread(node.childThreadId, "skip this node");
+      }
+      updateNodeStatus.run("skipped", node.id, planId);
+      touchPlan.run(Date.now(), planId);
+      publish();
+      return lookupPlanNode(planId, node.id);
+    };
+    if (!ownerId) return skip();
+    return withThreadLifecycle(ownerId, skip);
+  }
+
+  function resetCriticBlock(planId: string, attribution: { actor: string; source: string }): void {
+    const plan = requirePlan(planId);
+    const critic = nodesOf(planId)
+      .filter((node) => node.phase === "critic")
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .at(-1);
+    const commit = db.transaction(() => {
+      updatePlanFlags.run(correctionCountOf(plan), 0, Date.now(), planId);
+      if (critic) {
+        recordOutcome({
+          planId,
+          nodeId: critic.id,
+          verdict: null,
+          summary: "Operator reset Critic BLOCK.",
+          artifactPaths: [],
+          actor: attribution.actor,
+          source: attribution.source,
+        });
+      }
+    });
+    commit();
+    publish();
   }
 
   function formatStatus(status: Awaited<ReturnType<typeof statusPayload>>): string {
-    const { arc, nextNode, tier, plan, run } = status;
-    if (run) {
-      const current = run.currentNode;
-      const lines = [
-        `Harness: ${run.status} (${run.id})`,
-        `Task: ${run.taskPacket.objective}`,
-        current
-          ? `Stage: ${current.role} ${current.templateNodeKey} [${current.status}]`
-          : "Stage: (none)",
-      ];
-      if (current?.childThreadId) lines.push(`Child: ${current.childThreadId}`);
-      return lines.join("\n");
+    const { arc, nextNode, tier, plan, harness } = status;
+    if (!harness) {
+      return `Harness: inactive (${arc.threadId})`;
     }
     const copy = PHASE_COPY[arc.phase];
     const choice = nextNode
       ? resolvedChoice(plan?.nodes ?? [], nextNode)
       : currentRouting[routingSlotFor(arc.phase, 0)];
     const lines = [
-      `Harness: inactive (${arc.threadId})`,
-      `Legacy arc: ${copy.label}`,
+      `Harness: ${harness.name} (${arc.threadId})`,
+      `Phase: ${copy.label}`,
       copy.summary,
       `Model: ${formatChoice(choice)}  (prewalk ${tier})`,
     ];
     if (plan) {
       lines.push(
-        `Plan: ${plan.name} (${plan.id})  ${plan.doneCount}/${plan.nodeCount} done`,
+        `Plan: ${plan.name} (${plan.id})  ${plan.doneCount}/${plan.nodeCount} done  corrections ${plan.correctionCount}${plan.criticBlocked ? "  BLOCKED" : ""}`,
       );
+      if (plan.totals.durationMs != null || plan.totals.tokens.total != null) {
+        lines.push(
+          `Child telemetry: ${plan.totals.durationMs ?? "—"}ms  tokens ${plan.totals.tokens.total ?? "—"}`,
+        );
+      }
+      for (const warning of plan.skillWarnings) lines.push(warning);
     }
     if (nextNode) {
       lines.push(
@@ -1756,13 +2033,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   function formatPlan(plan: Awaited<ReturnType<typeof toFull>>): string {
     const lines = [
-      `${plan.name} (${plan.id})  ${plan.doneCount}/${plan.nodeCount} done`,
+      `${plan.name} (${plan.id})  ${plan.doneCount}/${plan.nodeCount} done  corrections ${plan.correctionCount}${plan.criticBlocked ? "  BLOCKED" : ""}`,
     ];
     for (const node of plan.nodes) {
       const mark =
         node.status === "done"
           ? "x"
-          : node.status === "in_progress"
+          : node.status === "in_progress" || node.status === "starting"
             ? ">"
             : node.status === "skipped"
               ? "-"
@@ -1770,8 +2047,10 @@ export default async function plugin(bb: BbPluginApi) {
       const deps = node.deps.length > 0 ? `  deps:${node.deps.join(",")}` : "";
       const child = node.childThreadId ? `  child:${node.childThreadId}` : "";
       const model = node.model ? `  ${node.providerId}/${node.model}` : "";
+      const verdict = node.result?.verdict ? `  ${node.result.verdict}` : "";
+      const tokens = node.attempt?.tokens.total != null ? `  tok:${node.attempt.tokens.total}` : "";
       lines.push(
-        `[${mark}] ${node.id.padEnd(16)} ${node.phase.padEnd(8)} ${node.title}${deps}${child}${model}`,
+        `[${mark}] ${node.id.padEnd(16)} ${node.phase.padEnd(8)} ${node.title}${deps}${child}${model}${verdict}${tokens}`,
       );
     }
     const next = nextWorkNode(plan.nodes);
@@ -1779,25 +2058,8 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
-  async function resolveWorkspace(threadId: string) {
-    const thread = await bb.sdk.threads.get({ threadId });
-    if (!thread.environmentId) {
-      throw new Error("This thread has no environment to initialize.");
-    }
-    const environment = await bb.sdk.environments.get({
-      environmentId: thread.environmentId,
-    });
-    if (!environment.path) {
-      throw new Error("Environment has no workspace path.");
-    }
-    return {
-      hostId: environment.hostId,
-      path: environment.path,
-      projectId: thread.projectId,
-    };
-  }
-
-  async function initWorkspace(threadId: string) {
+  async function initWorkspace(threadId: string, claimedProjectId?: string) {
+    await resolveProjectId(threadId, claimedProjectId);
     const { hostId, path } = await resolveWorkspace(threadId);
     const written: string[] = [];
     const skipped: string[] = [];
@@ -1810,12 +2072,13 @@ export default async function plugin(bb: BbPluginApi) {
           "Explore → Plan → Worker → Critic → Promote.",
           "",
           "- Isolate roles. A prompt that plans, implements, and critiques itself confuses its own objectives.",
-          "- v1 runs one fixed Worker + Tester node after plan approval.",
-          "- Every role spawns a visible child thread.",
-          "- Pick a provider/model per role in plugin settings, or override it on a run node.",
-          "- Keep auditable outputs in `artifacts/`. TUIs share this harness.",
+          "- Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn visible children.",
+          "- Standard Harness is the default. Custom Harnesses clone it with bounded policies.",
+          "- Critic completes with APPROVE, REWORK, or BLOCK.",
+          "- Pick a provider/model per role in plugin settings, or override it on a DAG node.",
+          "- Keep auditable outputs in `artifacts/`.",
           "",
-          "Commands: `bb harness status|advance|set-phase|init|plan …`",
+          "Commands: `bb harness status|advance|set-phase|start|plan …`",
           "",
         ].join("\n"),
       },
@@ -1863,19 +2126,184 @@ export default async function plugin(bb: BbPluginApi) {
     return { path, written, skipped };
   }
 
+  function assertCanStart(threadId: string): void {
+    if (readArc(threadId)) {
+      throw new Error("A Harness run is already active on this thread.");
+    }
+  }
+
+  async function startManualHarness(
+    input: z.infer<typeof startRunInputSchema>,
+    definition: HarnessDefinition,
+  ): Promise<void> {
+    const projectId = await resolveProjectId(input.threadId, input.projectId);
+    await stopHistoricalRun(input.threadId);
+    assertCanStart(input.threadId);
+    const now = Date.now();
+    const frozen = snapshotHarness(definition);
+    const planId = shortId();
+    if (frozen.artifactPolicy === "required") {
+      await ensureArtifactDir(input.threadId, planId, true);
+    } else if (frozen.artifactPolicy === "advisory") {
+      await ensureArtifactDir(input.threadId, planId, false);
+    }
+    const row: PlanRow = {
+      id: planId,
+      project_id: projectId,
+      thread_id: input.threadId,
+      name: input.objective.trim().slice(0, 200),
+      created_at: now,
+      updated_at: now,
+      harness_id: frozen.id,
+      harness_snapshot: JSON.stringify(frozen),
+      correction_count: 0,
+      critic_blocked: 0,
+    };
+    const insertAll = db.transaction(() => {
+      insertArc.run({
+        thread_id: input.threadId,
+        project_id: projectId,
+        phase: "explore",
+        note: input.objective.trim(),
+        updated_at: now,
+        harness_id: frozen.id,
+        plan_id: planId,
+      });
+      insertPlan.run(row);
+      insertSeedNodes(row.id, frozen);
+    });
+    try {
+      insertAll();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("UNIQUE")) {
+        throw new Error("A Harness run is already active on this thread.");
+      }
+      throw error;
+    }
+    if (frozen.artifactPolicy !== "off") {
+      await writeManifest(input.threadId, planId);
+    }
+    publish();
+  }
+
+
+  async function startRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
+    const harnessId = resolveHarnessId(input);
+    const definition = requireHarness(harnessId);
+    await startManualHarness(input, definition);
+  }
+
+  async function stopHistoricalRun(threadId: string): Promise<boolean> {
+    const live = historicalLiveRun(threadId);
+    if (!live) return false;
+    const now = Date.now();
+    cancelHistoricalRun.run(now, now, live.id);
+    failHistoricalRunNode.run(now, live.id);
+    const children = selectHistoricalRunNodes.all(live.id) as Array<{ child_thread_id: string | null }>;
+    for (const child of children) {
+      if (!child.child_thread_id) continue;
+      try {
+        await bb.sdk.threads.stop({ threadId: child.child_thread_id });
+      } catch {
+        // Best-effort cleanup of leftover Milestone children.
+      }
+    }
+    return true;
+  }
+
+  async function stopRun(threadId: string, claimedProjectId?: string): Promise<void> {
+    const projectId = await resolveProjectId(threadId, claimedProjectId);
+    return withThreadLifecycle(threadId, async () => {
+    const stoppedHistorical = await stopHistoricalRun(threadId);
+    const arc = readArc(threadId);
+    if (arc) {
+      if (arc.project_id !== projectId) {
+        throw new Error(`projectId ${arc.project_id} does not match thread ${threadId}.`);
+      }
+      const plan = activePlanForArc(arc);
+      if (plan) {
+        const live = nodesOf(plan.id);
+        await stopLiveChildren(live, "stop Harness");
+        const settle = db.transaction(() => {
+          for (const node of nodesOf(plan.id)) {
+            if (node.status === "in_progress") {
+              updateNodeStatus.run("skipped", node.id, plan.id);
+            }
+          }
+          deleteArc.run(threadId);
+        });
+        settle();
+      } else {
+        const candidates = liveCandidatePlans(arc);
+        if (candidates.length > 1) {
+          const live = candidates.flatMap((candidate) => nodesOf(candidate.id));
+          const childIds = live
+            .filter(
+              (node) =>
+                (node.status === "in_progress" || node.status === "starting") &&
+                node.childThreadId,
+            )
+            .map((node) => node.childThreadId!);
+          for (const childId of childIds) {
+            try {
+              await bb.sdk.threads.stop({ threadId: childId });
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `Cannot stop Harness: failed to stop child ${childId}. ${reason}`,
+              );
+            }
+          }
+          const settle = db.transaction(() => {
+            for (const candidate of candidates) {
+              for (const node of nodesOf(candidate.id)) {
+                if (node.status === "in_progress" || node.status === "starting") {
+                  updateNodeStatus.run("skipped", node.id, candidate.id);
+                }
+              }
+            }
+            deleteArc.run(threadId);
+          });
+          settle();
+          for (const childId of childIds) {
+            await closeAttemptForChild(childId);
+          }
+        } else {
+          deleteArc.run(threadId);
+        }
+      }
+      publish();
+      return;
+    }
+    if (stoppedHistorical) {
+      publish();
+      return;
+    }
+    throw new Error("No Harness run on this thread.");
+    });
+  }
+
+  async function reconcileFailedChild(threadId: string): Promise<void> {
+    await closeAttemptForChild(threadId);
+    // Re-read after telemetry close, then CAS. Done/skipped/stopped/new attempts stay.
+    const row = selectNodeByChild.get(threadId) as NodeRow | undefined;
+    if (!row) return;
+    const changed = casFailedChild.run(row.id, row.plan_id, threadId);
+    if (changed.changes === 1) publish();
+  }
+
   bb.rpc.register(rpcContract, {
     getStatus: async ({ threadId, projectId }) =>
       statusPayload(threadId, await resolveProjectId(threadId, projectId)),
     setPhase: async ({ threadId, projectId, phase, note }) => {
       const resolved = await resolveProjectId(threadId, projectId);
-      assertNoLiveRun(threadId);
       requireLegacyArc(threadId);
       writeArc(threadId, resolved, phase, note ?? "");
       return statusPayload(threadId, resolved);
     },
     advance: async ({ threadId, projectId }) => {
       const resolved = await resolveProjectId(threadId, projectId);
-      assertNoLiveRun(threadId);
       const arc = requireLegacyArc(threadId);
       const phase = isPhase(arc.phase) ? arc.phase : "explore";
       const next = nextPhase(phase);
@@ -1885,15 +2313,19 @@ export default async function plugin(bb: BbPluginApi) {
     },
     rewind: async ({ threadId, projectId }) => {
       const resolved = await resolveProjectId(threadId, projectId);
-      assertNoLiveRun(threadId);
       const arc = requireLegacyArc(threadId);
       const phase = isPhase(arc.phase) ? arc.phase : "explore";
       const prev = previousPhase(phase);
       if (!prev) throw new Error("Already at Explore.");
+      if (phase === "critic" && prev === "worker") {
+        const plan = activePlanForArc(arc);
+        if (plan) await reopenLastWorker(plan.id);
+      }
       writeArc(threadId, resolved, prev);
       return statusPayload(threadId, resolved);
     },
-    listPlans: ({ projectId, threadId }) => {
+    listPlans: async ({ projectId, threadId }) => {
+      if (threadId) await resolveProjectId(threadId, projectId);
       const rows = (
         threadId
           ? (selectPlansForThread.all(projectId, threadId) as PlanRow[])
@@ -1901,103 +2333,89 @@ export default async function plugin(bb: BbPluginApi) {
       );
       return { plans: rows.map((row) => toMeta(row)) };
     },
-    getPlan: async ({ id }) => {
+    getPlan: async ({ id, projectId, threadId }) => {
       const row = selectPlan.get(id) as PlanRow | undefined;
-      return { plan: row ? await toFull(row) : null };
+      if (!row) return { plan: null };
+      await requireParentPlan(id, threadId, projectId, "read");
+      return { plan: await toFull(row) };
     },
     createPlan: async ({ projectId, threadId, name, seedArc }) => {
+      const resolvedProject = await resolveProjectId(threadId, projectId);
       const now = Date.now();
       const row: PlanRow = {
         id: shortId(),
-        project_id: projectId,
-        thread_id: threadId ?? null,
+        project_id: resolvedProject,
+        thread_id: threadId,
         name,
         created_at: now,
         updated_at: now,
+        harness_id: STANDARD_HARNESS_ID,
+        harness_snapshot: null,
+        correction_count: 0,
+        critic_blocked: 0,
       };
       insertPlan.run(row);
-      if (seedArc !== false) insertSeedNodes(row.id);
-      publish();
-      return { plan: await toFull(row) };
-    },
-    addNode: async ({ planId, title, detail, phase, deps }) => {
-      const plan = requirePlan(planId);
-      const nodes = nodesOf(planId);
-      const id = uniqueNodeId(planId, title);
-      const resolvedDeps = deps ?? [];
-      if (wouldCycle([...nodes, {
-        id,
-        title,
-        detail: detail ?? "",
-        phase: phase ?? "worker",
-        status: "pending",
-        deps: resolvedDeps,
-        sortOrder: nodes.length,
-      }], id, resolvedDeps)) {
-        throw new Error("That dependency list would create a cycle.");
+      if (seedArc !== false) {
+        const frozen = snapshotHarness(standardHarnessDefinition(now));
+        insertSeedNodes(row.id, frozen);
+        persistPlanSnapshot(row.id, frozen);
       }
-      insertNode.run({
-        id,
-        plan_id: planId,
-        title,
-        detail: detail ?? "",
-        phase: phase ?? "worker",
-        status: "pending",
-        deps: JSON.stringify(resolvedDeps),
-        sort_order: nodes.length,
-      });
-      touchPlan.run(Date.now(), planId);
+      publish();
+      return { plan: await toFull(requirePlan(row.id)) };
+    },
+    addNode: async ({ planId, title, detail, phase, deps, projectId, threadId }) => {
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
+      addPlanNode({ planId, title, detail, phase, deps });
       publish();
       return { plan: await toFull(plan) };
     },
-    startNode: ({ planId, nodeId, threadId }) =>
-      startPlanNode(planId, nodeId, threadId),
+    startNode: async ({ planId, nodeId, threadId, projectId }) => {
+      await requireParentPlan(planId, threadId, projectId, "mutate");
+      return startPlanNode(planId, nodeId, threadId);
+    },
     getRouting: () => ({ routing: currentRouting }),
     setRouting: async ({ slot, choice }) => {
       if (!isRoutingSlot(slot)) throw new Error(`Unknown routing slot ${slot}`);
       const next = { ...currentRouting, [slot]: choice };
       return { routing: await saveRouting(next) };
     },
-    setNodeRouting: async ({ planId, nodeId, choice }) => {
-      const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
+    setNodeRouting: async ({ planId, nodeId, choice, projectId, threadId }) => {
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
+      const node = lookupPlanNode(planId, nodeId);
       updateNodeChoice.run(
         choice?.providerId ?? null,
         choice?.model ?? null,
         choice?.reasoningLevel ?? null,
         choice?.serviceTier ?? null,
-        nodeId,
+        node.id,
         planId,
       );
       touchPlan.run(Date.now(), planId);
       publish();
       return { plan: await toFull(plan) };
     },
-    setRunNodeRouting: async ({ threadId, projectId, nodeId, choice }) => {
-      setRunNodeRouting(threadId, nodeId, choice);
-      return statusPayload(threadId, await resolveProjectId(threadId, projectId));
-    },
     suggestChoice: async () => ({ choice: await firstAvailableChoice() }),
-    completeNode: async ({ planId, nodeId }) => {
-      const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
-      updateNodeStatus.run("done", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
+    completeNode: async (input) => {
+      const plan = await requireParentPlan(input.planId, input.threadId, input.projectId, "mutate");
+      await completePlanNode(input, { actor: "operator", source: "rpc" });
+      return { plan: await toFull(requirePlan(plan.id)) };
+    },
+    skipNode: async ({ planId, nodeId, projectId, threadId }) => {
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
+      await skipPlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
-    skipNode: async ({ planId, nodeId }) => {
-      const plan = requirePlan(planId);
-      const node = nodesOf(planId).find((candidate) => candidate.id === nodeId);
-      if (!node) throw new Error(`No node ${nodeId} on plan ${planId}`);
-      updateNodeStatus.run("skipped", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
-      return { plan: await toFull(plan) };
+    reopenNode: async ({ planId, nodeId, projectId, threadId }) => {
+      await requireParentPlan(planId, threadId, projectId, "mutate");
+      await reopenPlanNode(planId, nodeId);
+      return { plan: await toFull(requirePlan(planId)) };
     },
-    initWorkspace: ({ threadId }) => initWorkspace(threadId),
+    resetCriticBlock: async ({ planId, projectId, threadId }) => {
+      await requireParentPlan(planId, threadId, projectId, "mutate");
+      resetCriticBlock(planId, { actor: "operator", source: "rpc" });
+      return { plan: await toFull(requirePlan(planId)) };
+    },
+    initWorkspace: ({ threadId, projectId }) => initWorkspace(threadId, projectId),
     startRun: async (input) => {
       await startRun(input);
       return statusPayload(
@@ -2006,30 +2424,41 @@ export default async function plugin(bb: BbPluginApi) {
       );
     },
     stopRun: async ({ threadId, projectId }) => {
-      await stopRun(threadId);
+      await stopRun(threadId, projectId);
       return statusPayload(threadId, await resolveProjectId(threadId, projectId));
     },
-    approvePlan: async ({ threadId, projectId }) => {
-      await approvePlan(threadId);
-      return statusPayload(threadId, await resolveProjectId(threadId, projectId));
+    listHarnesses: () => ({ harnesses: catalogHarnesses() }),
+    createHarness: async (draft) => {
+      const created = cloneStandardHarness(draft, () => randomUUID());
+      if (customHarnesses.some((item) => item.id === created.id)) {
+        throw new Error(`Harness ${created.id} already exists.`);
+      }
+      await saveCustomHarnesses([...customHarnesses, created]);
+      return { harness: created };
     },
-    approveCorrection: async ({ threadId, projectId }) => {
-      await approveCorrection(threadId);
-      return statusPayload(threadId, await resolveProjectId(threadId, projectId));
+    updateHarness: async ({ id, ...draft }) => {
+      const current = customHarnesses.find((item) => item.id === id);
+      if (!current) {
+        if (isReservedHarnessId(id) || isRemovedHarnessId(id)) {
+          throw new Error("Built-in Harnesses are immutable.");
+        }
+        throw new Error(`Unknown Harness ${id}.`);
+      }
+      const next = applyHarnessPatch(current, draft);
+      await saveCustomHarnesses(
+        customHarnesses.map((item) => (item.id === id ? next : item)),
+      );
+      return { harness: next };
     },
-    retryStage: async ({ threadId, projectId, nodeId }) => {
-      await retryStage(threadId, nodeId);
-      return statusPayload(threadId, await resolveProjectId(threadId, projectId));
-    },
-    getRun: async ({ threadId, projectId, runId }) => {
-      await resolveProjectId(threadId, projectId);
-      const run = runId
-        ? (() => {
-            const row = selectRun.get(runId) as RunRow | undefined;
-            return row ? toRun(row) : null;
-          })()
-        : latestRunFor(ownerThreadId(threadId));
-      return { run: run ? await toRunDetails(run) : null };
+    deleteHarness: async ({ id }) => {
+      if (isReservedHarnessId(id) || isRemovedHarnessId(id)) {
+        throw new Error("Built-in Harnesses are immutable.");
+      }
+      if (!customHarnesses.some((item) => item.id === id)) {
+        throw new Error(`Unknown Harness ${id}.`);
+      }
+      await saveCustomHarnesses(customHarnesses.filter((item) => item.id !== id));
+      return { ok: true as const };
     },
   });
 
@@ -2045,17 +2474,17 @@ export default async function plugin(bb: BbPluginApi) {
     const out: string[] = [];
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i]!;
-      if (arg === "--json" || arg === "--seed" || arg === "--no-seed" || arg === "--no-scout") continue;
+      if (arg === "--json" || arg === "--seed" || arg === "--no-seed" || arg === "--milestone") continue;
       if (
         arg === "--thread" ||
         arg === "--phase" ||
         arg === "--deps" ||
         arg === "--task" ||
-        arg === "--exec-plan" ||
-        arg === "--branch" ||
-        arg === "--protected" ||
-        arg === "--specialist" ||
-        arg === "--node"
+        arg === "--node" ||
+        arg === "--harness" ||
+        arg === "--verdict" ||
+        arg === "--summary" ||
+        arg === "--artifacts"
       ) {
         i += 1;
         continue;
@@ -2074,18 +2503,15 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "rewind", summary: "Move the arc one phase back", usage: "bb harness rewind [--thread <id>] [--json]" },
       { name: "set-phase", summary: "Jump to a named phase", usage: "bb harness set-phase <phase> [--thread <id>] [--json]" },
       { name: "init", summary: "Scaffold artifacts/, plans/, and HARNESS.md in the workspace", usage: "bb harness init [--thread <id>] [--json]" },
-      { name: "start", summary: "Explicitly start a Harness run on this thread", usage: "bb harness start --task <text> [--no-scout] [--json]" },
+      { name: "start", summary: "Start Standard Harness by default, or a named Harness", usage: "bb harness start --task <text> [--harness <id>] [--json]" },
       { name: "stop", summary: "Cancel the active Harness run", usage: "bb harness stop [--thread <id>] [--json]" },
-      { name: "approve-plan", summary: "Approve the Planner packet and start Worker", usage: "bb harness approve-plan [--thread <id>] [--json]" },
-      { name: "approve-correction", summary: "Start the one allowed correction Worker", usage: "bb harness approve-correction [--thread <id>] [--json]" },
-      { name: "retry", summary: "Retry a failed Harness stage", usage: "bb harness retry [--node <id>] [--thread <id>] [--json]" },
       { name: "plan-list", summary: "List DAG plans for the current project", usage: "bb harness plan list [--json]" },
       { name: "plan-show", summary: "Show a DAG plan", usage: "bb harness plan show <plan-id> [--json]" },
       { name: "plan-create", summary: "Create a DAG plan (seeds the five-phase arc by default)", usage: "bb harness plan create <name> [--seed|--no-seed] [--json]" },
       { name: "plan-add", summary: "Add a node to a plan", usage: "bb harness plan add <plan-id> <title> [--phase worker] [--deps id,id] [--json]" },
       { name: "plan-next", summary: "Show the next unblocked node", usage: "bb harness plan next <plan-id> [--json]" },
       { name: "plan-start", summary: "Start a node (only one in progress at a time)", usage: "bb harness plan start <plan-id> <node-id> [--json]" },
-      { name: "plan-complete", summary: "Mark a node done", usage: "bb harness plan complete <plan-id> <node-id> [--json]" },
+      { name: "plan-complete", summary: "Mark a node done", usage: "bb harness plan complete <plan-id> <node-id> [--verdict APPROVE|REWORK|BLOCK] [--summary <text>] [--json]" },
     ],
     async run(argv, ctx) {
       const json = takeFlag(argv, "--json");
@@ -2124,20 +2550,17 @@ export default async function plugin(bb: BbPluginApi) {
           case "start": {
             const missing = needThread();
             if (missing) return missing;
+            if (takeFlag(argv, "--milestone")) {
+              return fail(removedHarnessError("milestone"));
+            }
             const task = takeOption(argv, "--task") ?? rest.join(" ").trim();
             if (!task) return fail("start needs --task <text>");
+            const harnessFlag = takeOption(argv, "--harness");
             await startRun({
               threadId: threadId!,
               projectId: ctx.projectId ?? undefined,
               objective: task,
-              branch: takeOption(argv, "--branch"),
-              execPlanPath: takeOption(argv, "--exec-plan"),
-              protectedPaths: (takeOption(argv, "--protected") ?? "")
-                .split(",")
-                .map((item) => item.trim())
-                .filter(Boolean),
-              runScout: !takeFlag(argv, "--no-scout"),
-              specialistQuestion: takeOption(argv, "--specialist"),
+              harnessId: harnessFlag,
             });
             const status = await statusPayload(
               threadId!,
@@ -2148,37 +2571,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "stop": {
             const missing = needThread();
             if (missing) return missing;
-            await stopRun(threadId!);
-            const status = await statusPayload(
-              threadId!,
-              await resolveProjectId(threadId!, ctx.projectId),
-            );
-            return reply(status, formatStatus(status));
-          }
-          case "approve-plan": {
-            const missing = needThread();
-            if (missing) return missing;
-            await approvePlan(threadId!);
-            const status = await statusPayload(
-              threadId!,
-              await resolveProjectId(threadId!, ctx.projectId),
-            );
-            return reply(status, formatStatus(status));
-          }
-          case "approve-correction": {
-            const missing = needThread();
-            if (missing) return missing;
-            await approveCorrection(threadId!);
-            const status = await statusPayload(
-              threadId!,
-              await resolveProjectId(threadId!, ctx.projectId),
-            );
-            return reply(status, formatStatus(status));
-          }
-          case "retry": {
-            const missing = needThread();
-            if (missing) return missing;
-            await retryStage(threadId!, takeOption(argv, "--node"));
+            await stopRun(threadId!, ctx.projectId);
             const status = await statusPayload(
               threadId!,
               await resolveProjectId(threadId!, ctx.projectId),
@@ -2189,7 +2582,6 @@ export default async function plugin(bb: BbPluginApi) {
             const missing = needThread();
             if (missing) return missing;
             const projectId = await resolveProjectId(threadId!, ctx.projectId);
-            assertNoLiveRun(threadId!);
             const arc = requireLegacyArc(threadId!);
             const phase = isPhase(arc.phase) ? arc.phase : "explore";
             const next = nextPhase(phase);
@@ -2202,11 +2594,14 @@ export default async function plugin(bb: BbPluginApi) {
             const missing = needThread();
             if (missing) return missing;
             const projectId = await resolveProjectId(threadId!, ctx.projectId);
-            assertNoLiveRun(threadId!);
             const arc = requireLegacyArc(threadId!);
             const phase = isPhase(arc.phase) ? arc.phase : "explore";
             const prev = previousPhase(phase);
             if (!prev) return fail("Already at Explore.");
+            if (phase === "critic" && prev === "worker") {
+              const plan = activePlanForArc(arc);
+              if (plan) await reopenLastWorker(plan.id);
+            }
             writeArc(threadId!, projectId, prev);
             const status = await statusPayload(threadId!, projectId);
             return reply(status, formatStatus(status));
@@ -2219,7 +2614,6 @@ export default async function plugin(bb: BbPluginApi) {
               return fail("set-phase needs explore|plan|worker|critic|promote");
             }
             const projectId = await resolveProjectId(threadId!, ctx.projectId);
-            assertNoLiveRun(threadId!);
             requireLegacyArc(threadId!);
             writeArc(threadId!, projectId, phase);
             const status = await statusPayload(threadId!, projectId);
@@ -2228,7 +2622,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "init": {
             const missing = needThread();
             if (missing) return missing;
-            const result = await initWorkspace(threadId!);
+            const result = await initWorkspace(threadId!, ctx.projectId);
             return reply(
               result,
               [
@@ -2268,6 +2662,7 @@ export default async function plugin(bb: BbPluginApi) {
               case "next": {
                 const id = rest[1];
                 if (!id) return fail(`plan ${sub} needs a plan id`);
+                await requireParentPlan(id, threadId, ctx.projectId, "read");
                 const plan = await toFull(requirePlan(id));
                 if (sub === "next") {
                   const next = nextWorkNode(plan.nodes);
@@ -2292,11 +2687,19 @@ export default async function plugin(bb: BbPluginApi) {
                   name,
                   created_at: now,
                   updated_at: now,
+                  harness_id: STANDARD_HARNESS_ID,
+                  harness_snapshot: null,
+                  correction_count: 0,
+                  critic_blocked: 0,
                 };
                 insertPlan.run(row);
-                if (!takeFlag(argv, "--no-seed")) insertSeedNodes(row.id);
+                if (!takeFlag(argv, "--no-seed")) {
+                  const frozen = snapshotHarness(standardHarnessDefinition(now));
+                  insertSeedNodes(row.id, frozen);
+                  persistPlanSnapshot(row.id, frozen);
+                }
                 publish();
-                const plan = await toFull(row);
+                const plan = await toFull(requirePlan(row.id));
                 return reply(plan, formatPlan(plan));
               }
               case "add": {
@@ -2309,43 +2712,57 @@ export default async function plugin(bb: BbPluginApi) {
                   .split(",")
                   .map((item) => item.trim())
                   .filter(Boolean);
-                const plan = requirePlan(planId);
-                const nodes = nodesOf(planId);
-                const id = uniqueNodeId(planId, title);
-                insertNode.run({
-                  id,
-                  plan_id: planId,
-                  title,
-                  detail: "",
-                  phase,
-                  status: "pending",
-                  deps: JSON.stringify(deps),
-                  sort_order: nodes.length,
-                });
-                touchPlan.run(Date.now(), planId);
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
+                addPlanNode({ planId, title, phase, deps });
                 publish();
-                const full = await toFull(plan);
+                const full = await toFull(requirePlan(planId));
                 return reply(full, formatPlan(full));
+              }
+              case "reset-block": {
+                const planId = rest[1];
+                if (!planId) return fail("plan reset-block <plan-id>");
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
+                resetCriticBlock(planId, { actor: "operator", source: "cli" });
+                const plan = await toFull(requirePlan(planId));
+                return reply(plan, formatPlan(plan));
               }
               case "start":
               case "complete":
-              case "skip": {
+              case "skip":
+              case "reopen": {
                 const planId = rest[1];
                 const nodeId = rest[2];
                 if (!planId || !nodeId) {
                   return fail(`plan ${sub} <plan-id> <node-id>`);
                 }
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
                 if (sub === "start") {
                   const started = await startPlanNode(planId, nodeId, threadId);
                   return reply(started.plan, formatPlan(started.plan));
                 }
-                updateNodeStatus.run(
-                  sub === "complete" ? "done" : "skipped",
-                  nodeId,
-                  planId,
-                );
-                touchPlan.run(Date.now(), planId);
-                publish();
+                if (sub === "complete") {
+                  const verdictRaw = takeOption(argv, "--verdict");
+                  const verdict =
+                    verdictRaw && (CRITIC_VERDICTS as readonly string[]).includes(verdictRaw)
+                      ? (verdictRaw as CriticVerdict)
+                      : undefined;
+                  const artifacts = (takeOption(argv, "--artifacts") ?? "")
+                    .split(",")
+                    .map((item) => item.trim())
+                    .filter(Boolean);
+                  await completePlanNode(
+                    {
+                      planId,
+                      nodeId,
+                      threadId: threadId!,
+                      verdict,
+                      summary: takeOption(argv, "--summary"),
+                      artifactPaths: artifacts.length ? artifacts : undefined,
+                    },
+                    { actor: "operator", source: "cli" },
+                  );
+                } else if (sub === "skip") await skipPlanNode(planId, nodeId);
+                else await reopenPlanNode(planId, nodeId);
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
               }
@@ -2379,7 +2796,7 @@ export default async function plugin(bb: BbPluginApi) {
     }),
     async execute({ threadId }, ctx) {
       const id = threadId ?? ctx.threadId;
-      if (!id) return "No thread id. Pass threadId or run inside a thread.";
+      if (!id) return "No thread id. Pass threadId or invoke inside a thread.";
       const projectId = await resolveProjectId(id, ctx.projectId ?? undefined);
       return JSON.stringify(await statusPayload(id, projectId), null, 2);
     },
@@ -2404,11 +2821,9 @@ export default async function plugin(bb: BbPluginApi) {
       if (!id) return "No thread id.";
       const projectId = await resolveProjectId(id, ctx.projectId ?? undefined);
       if (phase) {
-        assertNoLiveRun(id);
         requireLegacyArc(id);
         writeArc(id, projectId, phase);
       } else {
-        assertNoLiveRun(id);
         const arc = requireLegacyArc(id);
         const current = isPhase(arc.phase) ? arc.phase : "explore";
         const next = nextPhase(current);
@@ -2453,24 +2868,28 @@ export default async function plugin(bb: BbPluginApi) {
         name,
         created_at: now,
         updated_at: now,
+        harness_id: STANDARD_HARNESS_ID,
+        harness_snapshot: null,
+        correction_count: 0,
+        critic_blocked: 0,
       };
       insertPlan.run(row);
-      if (seedArc !== false) insertSeedNodes(row.id);
+      if (seedArc !== false) {
+        const frozen = snapshotHarness(standardHarnessDefinition(now));
+        insertSeedNodes(row.id, frozen);
+        persistPlanSnapshot(row.id, frozen);
+      }
       for (const node of nodes ?? []) {
-        const id = uniqueNodeId(row.id, node.title);
-        insertNode.run({
-          id,
-          plan_id: row.id,
+        addPlanNode({
+          planId: row.id,
           title: node.title,
-          detail: node.detail ?? "",
-          phase: node.phase ?? "worker",
-          status: "pending",
-          deps: JSON.stringify(node.deps ?? []),
-          sort_order: nodesOf(row.id).length,
+          detail: node.detail,
+          phase: node.phase,
+          deps: node.deps,
         });
       }
       publish();
-      return JSON.stringify(await toFull(row), null, 2);
+      return JSON.stringify(await toFull(requirePlan(row.id)), null, 2);
     },
   });
 
@@ -2489,9 +2908,10 @@ export default async function plugin(bb: BbPluginApi) {
       nodeId: z.string().optional(),
     }),
     async execute({ planId, nodeId }, ctx) {
+      await requireParentPlan(planId, ctx.threadId, ctx.projectId, "mutate");
       const nodes = nodesOf(planId);
       const target = nodeId
-        ? nodes.find((node) => node.id === nodeId)
+        ? lookupPlanNode(planId, nodeId)
         : nextWorkNode(nodes);
       if (!target) return "No remaining unblocked nodes.";
       try {
@@ -2509,79 +2929,104 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "harness_complete_node",
-    description: "Mark a DAG node done after finishing that one unit of work.",
+    description:
+      "Mark a DAG node done. Critic nodes require verdict APPROVE, REWORK, or BLOCK plus a summary.",
     presentation: {
       label: {
         pending: "Completing harness node",
         completed: "Completed harness node",
       },
     },
-    parameters: z.object({
-      planId: z.string(),
-      nodeId: z.string(),
-    }),
-    async execute({ planId, nodeId }) {
-      requirePlan(planId);
-      updateNodeStatus.run("done", nodeId, planId);
-      touchPlan.run(Date.now(), planId);
-      publish();
-      const plan = await toFull(requirePlan(planId));
-      const next = nextWorkNode(plan.nodes);
-      return JSON.stringify({ completed: nodeId, next, plan }, null, 2);
-    },
-  });
-
-  bb.agents.registerTool({
-    name: "harness_submit_result",
-    description:
-      "Submit the structured Harness role packet for this child stage. Submit exactly once, then stop.",
-    instructions:
-      "When you are a Harness role child, submit exactly one packet with harness_submit_result, then stop. Free-form output is not workflow authority.",
-    presentation: {
-      label: {
-        pending: "Submitting harness packet",
-        completed: "Submitted harness packet",
-      },
-    },
-    parameters: z.object({
-      role: z.enum(AGENT_ROLES),
-      kind: z.enum(PACKET_KINDS),
-      payload: z.unknown(),
-    }),
-    async execute({ role, kind, payload }, ctx) {
-      if (!ctx.threadId) return "No thread id.";
-      try {
-        return await submitRunPacket({
-          threadId: ctx.threadId,
-          role,
-          kind,
-          payload,
-        });
-      } catch (error) {
-        const text = error instanceof Error ? error.message : String(error);
-        return { content: [{ type: "text", text }], isError: true };
+    parameters: completeNodeInputSchema.omit({ threadId: true }),
+    async execute(input, ctx) {
+      if (!ctx.threadId) {
+        return "Invoke this tool from the parent thread that owns the plan.";
       }
+      await requireParentPlan(input.planId, ctx.threadId, ctx.projectId, "mutate");
+      const completed = await completePlanNode(
+        { ...input, threadId: ctx.threadId },
+        { actor: "parent-agent", source: "harness_complete_node" },
+      );
+      const plan = await toFull(requirePlan(input.planId));
+      const next = nextWorkNode(plan.nodes);
+      return JSON.stringify({ completed: completed.id, next, plan }, null, 2);
     },
   });
 
-  bb.agents.configure((context) => {
-    const child = selectRunNodeByChild.get(context.thread.id) as RunNodeRow | undefined;
-    if (child) {
-      const runRow = selectRun.get(child.run_id) as RunRow | undefined;
-      if (runRow && isLiveRunStatus(runRow.status)) {
-        return {
-          tools: ["harness_submit_result"],
-          skills: [],
-          instructions: participantInstruction(child.role as AgentRole),
-        };
+  function liveChildNode(threadId: string): PlanNode | null {
+    const child = selectNodeByChild.get(threadId) as NodeRow | undefined;
+    if (!child) return null;
+    const node = toNode(child);
+    if (node.status !== "in_progress" && node.status !== "starting") return null;
+    const plan = selectPlan.get(child.plan_id) as PlanRow | undefined;
+    if (!plan?.thread_id) return null;
+    const arc = readArc(plan.thread_id);
+    if (!arc) return null;
+    const active = activePlanForArc(arc);
+    if (!active || active.id !== plan.id) return null;
+    return node;
+  }
+
+  function parentExecutionInstructions(threadId: string): string | null {
+    const owner = ownerThreadId(threadId);
+    const arc = readArc(owner);
+    if (!arc) return null;
+    const phase = isPhase(arc.phase) ? arc.phase : "explore";
+    const plan = activePlanForArc(arc);
+    if (plan) {
+      const inflight = activeNode(nodesOf(plan.id));
+      if (inflight && !nodeSpawnsChild(inflight)) {
+        return nodePrompt(inflight, inflight.phase);
+      }
+      const snapshot = snapshotOf(plan);
+      const spec = snapshot?.phases[phase];
+      if (spec && spec.execution === "parent") {
+        return nodePrompt(
+          {
+            id: `${plan.id}-${phase}`,
+            title: spec.title,
+            detail: spec.detail,
+            phase,
+            status: "pending",
+            deps: [],
+            sortOrder: 0,
+          },
+          phase,
+        );
       }
     }
-    const live = liveRunFor(context.thread.id);
-    if (live) {
+    return [
+      `You are on the ${PHASE_COPY[phase].label} phase of an explicit Harness.`,
+      PHASE_COPY[phase].summary,
+      "Explore and Plan stay on this parent thread unless a frozen custom definition sets child execution.",
+      "Worker, Critic, and Promote spawn visible children by default.",
+      "The parent operator records Critic APPROVE, REWORK, or BLOCK.",
+      "Work one DAG node at a time.",
+    ].join(" ");
+  }
+
+  bb.agents.configure((context) => {
+    const child = liveChildNode(context.thread.id);
+    if (child) {
       return {
-        tools: [],
-        skills: [],
-        instructions: participantInstruction("operator"),
+        tools: ["harness_get_arc"],
+        skills: [PLUGIN_SKILL_NAME],
+        instructions: nodePrompt(child, child.phase),
+      };
+    }
+    const owner = ownerThreadId(context.thread.id);
+    const arc = readArc(owner);
+    if (arc) {
+      return {
+        tools: [
+          "harness_get_arc",
+          "harness_advance",
+          "harness_create_plan",
+          "harness_next_node",
+          "harness_complete_node",
+        ],
+        skills: [PLUGIN_SKILL_NAME],
+        instructions: parentExecutionInstructions(context.thread.id) ?? "",
       };
     }
     return { tools: [], skills: [] };
@@ -2589,32 +3034,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.contributeInstructions(({ threadId, projectId }) => {
     if (!threadId || !projectId) return null;
-    const child = selectRunNodeByChild.get(threadId) as RunNodeRow | undefined;
-    if (child) {
-      const runRow = selectRun.get(child.run_id) as RunRow | undefined;
-      if (runRow && isLiveRunStatus(runRow.status)) {
-        return participantInstruction(child.role as AgentRole);
-      }
-      return null;
-    }
-    const live = liveRunFor(threadId);
-    if (!live) return null;
-    return participantInstruction("operator");
+    const child = liveChildNode(threadId);
+    if (child) return nodePrompt(child, child.phase);
+    return parentExecutionInstructions(threadId);
   });
 
   const refreshChild = ({ thread }: { thread: { id: string } }) => {
     const row = selectNodeByChild.get(thread.id) as NodeRow | undefined;
-    const runRow = selectRunNodeByChild.get(thread.id) as RunNodeRow | undefined;
-    if (row || runRow) publish();
+    if (row) publish();
   };
   bb.events.on("thread.idle", (payload) => {
-    failActiveChildWithoutPacket(payload.thread.id);
+    void closeAttemptForChild(payload.thread.id);
     refreshChild(payload);
   });
   bb.events.on("thread.active", refreshChild);
   bb.events.on("thread.failed", (payload) => {
-    failActiveChildWithoutPacket(payload.thread.id);
-    refreshChild(payload);
+    void reconcileFailedChild(payload.thread.id).then(() => refreshChild(payload));
   });
 
   bb.onDispose(() => {

@@ -124,11 +124,10 @@ export function HarnessSettings() {
   return (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
-        Pick a real provider and model for each role. Every Harness run node
-        (Scout, Planner, Worker + Tester, Reviewer, Promote) spawns a visible
-        child with that selection. Leave a slot unset to inherit the parent
-        thread. Pending or failed run nodes can override that slot; spawned
-        nodes show the resolved choice frozen at spawn.
+        Pick a real provider and model for each role. Standard Harness: Explore
+        and Plan inherit on the parent; Worker, Critic, and Promote spawn
+        children unless a custom definition changes execution. Leave a slot
+        unset to inherit the parent thread.
       </p>
       {ROUTING_SLOTS.map((slot) => (
         <div key={slot} className="space-y-1.5 border-b border-border pb-3 last:border-0">
