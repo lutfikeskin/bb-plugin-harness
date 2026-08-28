@@ -12,7 +12,7 @@ const PROJECT = "proj_test";
 const PARENT = "thr_parent";
 const ENV = "env_parent";
 
-async function loadPlugin(options?: { allowSpawn?: boolean }) {
+async function loadPlugin(options?: { allowSpawn?: boolean; stopError?: string }) {
   let childSeq = 0;
   const threads = new Map([
     [
@@ -48,12 +48,55 @@ async function loadPlugin(options?: { allowSpawn?: boolean }) {
           threads.set(child.id, child);
           return child;
         },
-        stop: async ({ threadId }: { threadId: string }) => threads.get(threadId),
+        stop: async ({ threadId }: { threadId: string }) => {
+          if (options?.stopError) throw new Error(options.stopError);
+          return threads.get(threadId);
+        },
       },
     },
   });
   await plugin(host.bb);
   return Object.assign(host, { threads });
+}
+
+type PlanNodeView = {
+  id: string;
+  phase: string;
+  status: string;
+  childThreadId: string | null;
+};
+
+async function startThroughCritic(pluginHost: FakePluginHost) {
+  const started = (await pluginHost.harness.behavior.callRpc("startRun", {
+    threadId: PARENT,
+    projectId: PROJECT,
+    objective: "Rewind path",
+  })) as { plan: { id: string; nodes: PlanNodeView[] } };
+  const planId = started.plan.id;
+  for (const alias of ["explore", "plan", "worker"]) {
+    await pluginHost.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: alias,
+      threadId: PARENT,
+    });
+    await pluginHost.harness.behavior.callRpc("completeNode", {
+      planId,
+      nodeId: alias,
+    });
+  }
+  await pluginHost.harness.behavior.callRpc("setPhase", {
+    threadId: PARENT,
+    projectId: PROJECT,
+    phase: "critic",
+  });
+  const afterCritic = (await pluginHost.harness.behavior.callRpc("startNode", {
+    planId,
+    nodeId: "critic",
+    threadId: PARENT,
+  })) as { plan: { nodes: PlanNodeView[] } };
+  const critic = afterCritic.plan.nodes.find((node) => node.phase === "critic");
+  const worker = afterCritic.plan.nodes.find((node) => node.phase === "worker");
+  return { planId, critic, worker };
 }
 
 describe("standard and custom harnesses", () => {
@@ -283,46 +326,77 @@ describe("standard and custom harnesses", () => {
 
   it("reopens the last Worker when Critic rewinds", async () => {
     host = await loadPlugin({ allowSpawn: true });
-    const started = (await host.harness.behavior.callRpc("startRun", {
-      threadId: PARENT,
-      projectId: PROJECT,
-      objective: "Rewind path",
-    })) as { plan: { id: string; nodes: Array<{ id: string; phase: string }> } };
-    const planId = started.plan.id;
-    for (const alias of ["explore", "plan", "worker"]) {
-      await host.harness.behavior.callRpc("startNode", {
-        planId,
-        nodeId: alias,
-        threadId: PARENT,
-      });
-      await host.harness.behavior.callRpc("completeNode", {
-        planId,
-        nodeId: alias,
-      });
-    }
-    await host.harness.behavior.callRpc("setPhase", {
-      threadId: PARENT,
-      projectId: PROJECT,
-      phase: "critic",
-    });
-    await host.harness.behavior.callRpc("startNode", {
-      planId,
-      nodeId: "critic",
-      threadId: PARENT,
-    });
+    const { planId, critic: liveCritic } = await startThroughCritic(host);
+    expect(liveCritic?.status).toBe("in_progress");
+    expect(liveCritic?.childThreadId).toMatch(/^thr_child_/);
+    const criticChildId = liveCritic!.childThreadId!;
+
     const rewound = (await host.harness.behavior.callRpc("rewind", {
       threadId: PARENT,
       projectId: PROJECT,
     })) as {
       arc: { phase: string };
-      plan: { nodes: Array<{ phase: string; status: string; childThreadId: string | null }> };
+      plan: { nodes: PlanNodeView[] };
     };
     expect(rewound.arc.phase).toBe("worker");
+    const stopCalls = host.harness.inspection.sdk.callsTo("threads.stop");
+    expect(stopCalls).toEqual([[{ threadId: criticChildId }]]);
     const worker = rewound.plan.nodes.find((node) => node.phase === "worker");
     const critic = rewound.plan.nodes.find((node) => node.phase === "critic");
     expect(worker?.status).toBe("pending");
     expect(worker?.childThreadId).toBeNull();
     expect(critic?.status).toBe("pending");
+    expect(critic?.childThreadId).toBe(criticChildId);
+
+    const reopened = (await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+    })) as { plan: { nodes: PlanNodeView[] } };
+    expect(reopened.plan.nodes.find((node) => node.phase === "worker")?.status).toBe(
+      "in_progress",
+    );
+    expect(reopened.plan.nodes.find((node) => node.phase === "critic")?.status).toBe(
+      "pending",
+    );
+  });
+
+  it("does not reopen Worker if stopping the live Critic child fails", async () => {
+    host = await loadPlugin({ allowSpawn: true, stopError: "child still running" });
+    const { planId, critic: liveCritic, worker: doneWorker } = await startThroughCritic(
+      host,
+    );
+    const criticChildId = liveCritic!.childThreadId!;
+    expect(doneWorker?.status).toBe("done");
+
+    await expect(
+      host.harness.behavior.callRpc("rewind", {
+        threadId: PARENT,
+        projectId: PROJECT,
+      }),
+    ).rejects.toThrow(/failed to stop Critic child/);
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+      [{ threadId: criticChildId }],
+    ]);
+
+    const status = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { arc: { phase: string }; plan: { nodes: PlanNodeView[] } };
+    expect(status.arc.phase).toBe("critic");
+    const worker = status.plan.nodes.find((node) => node.phase === "worker");
+    const critic = status.plan.nodes.find((node) => node.phase === "critic");
+    expect(worker?.status).toBe("done");
+    expect(critic?.status).toBe("in_progress");
+    expect(critic?.childThreadId).toBe(criticChildId);
+
+    await expect(
+      host.harness.behavior.callRpc("startNode", {
+        planId,
+        nodeId: "worker",
+        threadId: PARENT,
+      }),
+    ).rejects.toThrow(/cannot start|already in progress/i);
   });
 
   it("rejects a caller projectId that does not match the thread", async () => {

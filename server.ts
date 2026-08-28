@@ -2014,7 +2014,25 @@ export default async function plugin(bb: BbPluginApi) {
     return node;
   }
 
-  function reopenPlanNode(planId: string, nodeId: string): PlanNode {
+  async function stopInProgressCriticChildren(planId: string): Promise<PlanNode[]> {
+    const critics = nodesOf(planId).filter(
+      (candidate) => candidate.phase === "critic" && candidate.status === "in_progress",
+    );
+    for (const critic of critics) {
+      if (!critic.childThreadId) continue;
+      try {
+        await bb.sdk.threads.stop({ threadId: critic.childThreadId });
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `Cannot reopen Worker: failed to stop Critic child ${critic.childThreadId}. ${reason}`,
+        );
+      }
+    }
+    return critics;
+  }
+
+  async function reopenPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
     const node = lookupPlanNode(planId, nodeId);
     if (node.phase !== "worker") {
       throw new Error("Only Worker nodes can be reopened after Critic.");
@@ -2022,25 +2040,23 @@ export default async function plugin(bb: BbPluginApi) {
     if (node.status !== "done") {
       throw new Error(`Node ${node.id} must be done before it can be reopened.`);
     }
+    const critics = await stopInProgressCriticChildren(planId);
     resetPlanNode.run("pending", node.id, planId);
-    const critics = nodesOf(planId).filter(
-      (candidate) => candidate.phase === "critic" && candidate.status === "in_progress",
-    );
     for (const critic of critics) {
-      resetPlanNode.run("pending", critic.id, planId);
+      updateNodeStatus.run("pending", critic.id, planId);
     }
     touchPlan.run(Date.now(), planId);
     publish();
     return lookupPlanNode(planId, node.id);
   }
 
-  function reopenLastWorker(planId: string): void {
+  async function reopenLastWorker(planId: string): Promise<void> {
     const workers = nodesOf(planId)
       .filter((node) => node.phase === "worker" && node.status === "done")
       .sort((a, b) => a.sortOrder - b.sortOrder);
     const last = workers[workers.length - 1];
     if (!last) return;
-    reopenPlanNode(planId, last.id);
+    await reopenPlanNode(planId, last.id);
   }
 
   function formatStatus(status: Awaited<ReturnType<typeof statusPayload>>): string {
@@ -2219,11 +2235,11 @@ export default async function plugin(bb: BbPluginApi) {
       const phase = isPhase(arc.phase) ? arc.phase : "explore";
       const prev = previousPhase(phase);
       if (!prev) throw new Error("Already at Explore.");
-      writeArc(threadId, resolved, prev);
       if (phase === "critic" && prev === "worker") {
         const plan = planForThread(resolved, threadId);
-        if (plan) reopenLastWorker(plan.id);
+        if (plan) await reopenLastWorker(plan.id);
       }
+      writeArc(threadId, resolved, prev);
       return statusPayload(threadId, resolved);
     },
     listPlans: async ({ projectId, threadId }) => {
@@ -2308,7 +2324,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
     reopenNode: async ({ planId, nodeId }) => {
       const plan = requirePlan(planId);
-      reopenPlanNode(planId, nodeId);
+      await reopenPlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
     initWorkspace: ({ threadId }) => initWorkspace(threadId),
@@ -2553,11 +2569,11 @@ export default async function plugin(bb: BbPluginApi) {
             const phase = isPhase(arc.phase) ? arc.phase : "explore";
             const prev = previousPhase(phase);
             if (!prev) return fail("Already at Explore.");
-            writeArc(threadId!, projectId, prev);
             if (phase === "critic" && prev === "worker") {
               const plan = planForThread(projectId, threadId!);
-              if (plan) reopenLastWorker(plan.id);
+              if (plan) await reopenLastWorker(plan.id);
             }
+            writeArc(threadId!, projectId, prev);
             const status = await statusPayload(threadId!, projectId);
             return reply(status, formatStatus(status));
           }
@@ -2685,7 +2701,7 @@ export default async function plugin(bb: BbPluginApi) {
                 }
                 if (sub === "complete") completePlanNode(planId, nodeId);
                 else if (sub === "skip") skipPlanNode(planId, nodeId);
-                else reopenPlanNode(planId, nodeId);
+                else await reopenPlanNode(planId, nodeId);
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
               }
