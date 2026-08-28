@@ -1434,6 +1434,38 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  const threadLifecycleTails = new Map<string, Promise<unknown>>();
+
+  async function withThreadLifecycle<T>(threadId: string, work: () => Promise<T>): Promise<T> {
+    const previous = threadLifecycleTails.get(threadId) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const mine = previous.catch(() => undefined).then(() => held);
+    threadLifecycleTails.set(threadId, mine);
+    try {
+      await previous.catch(() => undefined);
+      return await work();
+    } finally {
+      release();
+      if (threadLifecycleTails.get(threadId) === mine) {
+        threadLifecycleTails.delete(threadId);
+      }
+    }
+  }
+
+  function assertActiveHarnessPlan(plan: PlanRow, threadId: string): void {
+    const arc = readArc(threadId);
+    if (!arc) {
+      throw new Error("No active Harness run on this thread.");
+    }
+    const current = planForThread(arc.project_id, threadId);
+    if (!current || current.id !== plan.id) {
+      throw new Error("This plan is not the active Harness run on this thread.");
+    }
+  }
+
   async function inheritedAttemptRouting(
     parentThreadId: string,
     parentProviderId: string,
@@ -1462,7 +1494,20 @@ export default async function plugin(bb: BbPluginApi) {
     nodeId: string,
     parentThreadId?: string,
   ) {
+    const ownerId = requirePlan(planId).thread_id ?? parentThreadId;
+    if (!ownerId) {
+      throw new Error("Need a parent thread to execute this node.");
+    }
+    return withThreadLifecycle(ownerId, () => startPlanNodeLocked(planId, nodeId, ownerId));
+  }
+
+  async function startPlanNodeLocked(
+    planId: string,
+    nodeId: string,
+    parentThreadId: string,
+  ) {
     const plan = requirePlan(planId);
+    assertActiveHarnessPlan(plan, parentThreadId);
     const node = lookupPlanNode(planId, nodeId);
     const nodes = nodesOf(planId);
     const inflight = activeNode(nodes);
@@ -1506,14 +1551,10 @@ export default async function plugin(bb: BbPluginApi) {
       return { plan: await toFull(requirePlan(planId)) };
     }
 
-    const parentId = plan.thread_id ?? parentThreadId;
     const recoverClaim = () => {
       recoverStartingNode.run(node.id, planId);
     };
-    if (!parentId) {
-      recoverClaim();
-      throw new Error("Need a parent thread to spawn a child for this node's execution mode.");
-    }
+    const parentId = plan.thread_id ?? parentThreadId;
 
     let spawnedId: string | null = null;
     try {
@@ -1867,19 +1908,24 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
-    const node = lookupPlanNode(planId, nodeId);
-    if (node.status === "starting") {
-      throw new Error(
-        `Cannot skip ${node.id} while it is starting. Retry after the child is attached.`,
-      );
-    }
-    if (node.status === "in_progress" && node.childThreadId) {
-      await stopChildThread(node.childThreadId, "skip this node");
-    }
-    updateNodeStatus.run("skipped", node.id, planId);
-    touchPlan.run(Date.now(), planId);
-    publish();
-    return lookupPlanNode(planId, node.id);
+    const ownerId = requirePlan(planId).thread_id;
+    const skip = async () => {
+      const node = lookupPlanNode(planId, nodeId);
+      if (node.status === "starting") {
+        throw new Error(
+          `Cannot skip ${node.id} while it is starting. Retry after the child is attached.`,
+        );
+      }
+      if (node.status === "in_progress" && node.childThreadId) {
+        await stopChildThread(node.childThreadId, "skip this node");
+      }
+      updateNodeStatus.run("skipped", node.id, planId);
+      touchPlan.run(Date.now(), planId);
+      publish();
+      return lookupPlanNode(planId, node.id);
+    };
+    if (!ownerId) return skip();
+    return withThreadLifecycle(ownerId, skip);
   }
 
   function resetCriticBlock(planId: string, attribution: { actor: string; source: string }): void {
@@ -2122,23 +2168,13 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function stopRun(threadId: string, claimedProjectId?: string): Promise<void> {
     const projectId = await resolveProjectId(threadId, claimedProjectId);
+    return withThreadLifecycle(threadId, async () => {
+    const stoppedHistorical = await stopHistoricalRun(threadId);
     const arc = readArc(threadId);
     if (arc) {
       if (arc.project_id !== projectId) {
         throw new Error(`projectId ${arc.project_id} does not match thread ${threadId}.`);
       }
-      const plan = planForThread(arc.project_id, threadId);
-      if (plan) {
-        const starting = nodesOf(plan.id).find((node) => node.status === "starting");
-        if (starting) {
-          throw new Error(
-            `Cannot stop Harness while ${starting.id} is starting. Retry after the child is attached.`,
-          );
-        }
-      }
-    }
-    const stoppedHistorical = await stopHistoricalRun(threadId);
-    if (arc) {
       const plan = planForThread(arc.project_id, threadId);
       if (plan) {
         const live = nodesOf(plan.id);
@@ -2163,6 +2199,7 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     throw new Error("No Harness run on this thread.");
+    });
   }
 
   async function reconcileFailedChild(threadId: string): Promise<void> {
