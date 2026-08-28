@@ -180,6 +180,30 @@ async function waitForNodeStatus(
   throw new Error(`timed out waiting for ${phase} to be ${status}`);
 }
 
+function seedLegacyThreadPlan(
+  db: ReturnType<FakePluginHost["bb"]["storage"]["database"]>,
+  args: { id: string; name: string; updatedAt: number; workerChildId: string | null },
+) {
+  db.prepare(
+    `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at, harness_id, harness_snapshot, correction_count, critic_blocked)
+     VALUES (?, ?, ?, ?, ?, ?, 'standard', NULL, 0, 0)`,
+  ).run(args.id, PROJECT, PARENT, args.name, args.updatedAt, args.updatedAt);
+  for (const [index, phase] of ["explore", "plan", "worker", "critic", "promote"].entries()) {
+    db.prepare(
+      `INSERT INTO plan_nodes (id, plan_id, title, detail, phase, status, deps, sort_order, child_thread_id, execution, skills)
+       VALUES (?, ?, ?, '', ?, ?, '[]', ?, ?, 'child', '[]')`,
+    ).run(
+      `${args.id}-${phase}`,
+      args.id,
+      phase,
+      phase,
+      phase === "worker" && args.workerChildId ? "in_progress" : "pending",
+      index,
+      phase === "worker" ? args.workerChildId : null,
+    );
+  }
+}
+
 describe("standard and custom harnesses", () => {
   let host: (FakePluginHost & {
     threads: Map<string, unknown>;
@@ -1519,6 +1543,146 @@ describe("standard and custom harnesses", () => {
     expect(
       (ambiguous.prepare("SELECT COUNT(*) AS n FROM arcs").get() as { n: number }).n,
     ).toBe(0);
+  });
+
+  it("stops every live legacy child when plan_id is ambiguous then deletes the arc", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const db = host.bb.storage.database();
+    db.prepare("DELETE FROM arcs").run();
+    db.prepare("DELETE FROM plan_node_attempts").run();
+    db.prepare("DELETE FROM plan_nodes").run();
+    db.prepare("DELETE FROM plans").run();
+    const stamp = Date.now();
+    seedLegacyThreadPlan(db, {
+      id: "plan_a",
+      name: "A",
+      updatedAt: stamp,
+      workerChildId: "thr_legacy_a",
+    });
+    seedLegacyThreadPlan(db, {
+      id: "plan_b",
+      name: "B",
+      updatedAt: stamp + 10,
+      workerChildId: "thr_legacy_b",
+    });
+    seedLegacyThreadPlan(db, {
+      id: "plan_c",
+      name: "C pending",
+      updatedAt: stamp + 20,
+      workerChildId: null,
+    });
+    db.prepare(
+      `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+       VALUES (?, ?, 'worker', '', ?, 'standard', NULL)`,
+    ).run(PARENT, PROJECT, stamp);
+    for (const id of ["thr_legacy_a", "thr_legacy_b"]) {
+      host.threads.set(
+        id,
+        makeThreadResponse({
+          id,
+          projectId: PROJECT,
+          environmentId: ENV,
+          parentThreadId: PARENT,
+        }),
+      );
+    }
+    const status = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { id: string } | null };
+    expect(status.plan).toBeNull();
+    expect(
+      (db.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string | null })
+        .plan_id,
+    ).toBeNull();
+    await host.harness.behavior.callRpc("stopRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+      [{ threadId: "thr_legacy_a" }],
+      [{ threadId: "thr_legacy_b" }],
+    ]);
+    expect((db.prepare("SELECT COUNT(*) AS n FROM arcs").get() as { n: number }).n).toBe(0);
+    const statuses = db
+      .prepare(
+        `SELECT id, status FROM plan_nodes WHERE phase = 'worker' ORDER BY id`,
+      )
+      .all() as Array<{ id: string; status: string }>;
+    expect(statuses).toEqual([
+      { id: "plan_a-worker", status: "skipped" },
+      { id: "plan_b-worker", status: "skipped" },
+      { id: "plan_c-worker", status: "pending" },
+    ]);
+    expect(
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM plan_nodes WHERE status IN ('in_progress', 'starting')`,
+          )
+          .get() as { n: number }
+      ).n,
+    ).toBe(0);
+  });
+
+  it("keeps the legacy arc when an ambiguous Stop cannot stop a live child", async () => {
+    host = await loadPlugin({ allowSpawn: true, stopError: "child still running" });
+    const db = host.bb.storage.database();
+    db.prepare("DELETE FROM arcs").run();
+    db.prepare("DELETE FROM plan_node_attempts").run();
+    db.prepare("DELETE FROM plan_nodes").run();
+    db.prepare("DELETE FROM plans").run();
+    const stamp = Date.now();
+    seedLegacyThreadPlan(db, {
+      id: "plan_a",
+      name: "A",
+      updatedAt: stamp,
+      workerChildId: "thr_legacy_a",
+    });
+    seedLegacyThreadPlan(db, {
+      id: "plan_b",
+      name: "B",
+      updatedAt: stamp + 10,
+      workerChildId: "thr_legacy_b",
+    });
+    db.prepare(
+      `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+       VALUES (?, ?, 'worker', '', ?, 'standard', NULL)`,
+    ).run(PARENT, PROJECT, stamp);
+    for (const id of ["thr_legacy_a", "thr_legacy_b"]) {
+      host.threads.set(
+        id,
+        makeThreadResponse({
+          id,
+          projectId: PROJECT,
+          environmentId: ENV,
+          parentThreadId: PARENT,
+        }),
+      );
+    }
+    await expect(
+      host.harness.behavior.callRpc("stopRun", {
+        threadId: PARENT,
+        projectId: PROJECT,
+      }),
+    ).rejects.toThrow(/failed to stop child thr_legacy_a/i);
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+      [{ threadId: "thr_legacy_a" }],
+    ]);
+    expect(
+      (db.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string | null })
+        .plan_id,
+    ).toBeNull();
+    expect((db.prepare("SELECT COUNT(*) AS n FROM arcs").get() as { n: number }).n).toBe(1);
+    const statuses = db
+      .prepare(
+        `SELECT id, status FROM plan_nodes WHERE phase = 'worker' ORDER BY id`,
+      )
+      .all() as Array<{ id: string; status: string }>;
+    expect(statuses).toEqual([
+      { id: "plan_a-worker", status: "in_progress" },
+      { id: "plan_b-worker", status: "in_progress" },
+    ]);
   });
 
   it("does not let a failed-child event overwrite a completed node", async () => {

@@ -1123,6 +1123,17 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error("This plan does not belong to this project or thread.");
   }
 
+  function liveCandidatePlans(arc: ArcRow): PlanRow[] {
+    return (selectPlansForThread.all(arc.project_id, arc.thread_id) as PlanRow[])
+      .slice()
+      .sort((left, right) => left.id.localeCompare(right.id))
+      .filter((row) =>
+        nodesOf(row.id).some(
+          (node) => node.status === "in_progress" || node.status === "starting",
+        ),
+      );
+  }
+
   function activePlanForArc(arc: ArcRow): PlanRow | null {
     if (arc.plan_id) {
       const bound = selectPlan.get(arc.plan_id) as PlanRow | undefined;
@@ -1142,11 +1153,7 @@ export default async function plugin(bb: BbPluginApi) {
       arc.plan_id = only.id;
       return only;
     }
-    const live = rows.filter((row) =>
-      nodesOf(row.id).some(
-        (node) => node.status === "in_progress" || node.status === "starting",
-      ),
-    );
+    const live = liveCandidatePlans(arc);
     return live.length === 1 ? live[0]! : null;
   }
 
@@ -2228,7 +2235,43 @@ export default async function plugin(bb: BbPluginApi) {
         });
         settle();
       } else {
-        deleteArc.run(threadId);
+        const candidates = liveCandidatePlans(arc);
+        if (candidates.length > 1) {
+          const live = candidates.flatMap((candidate) => nodesOf(candidate.id));
+          const childIds = live
+            .filter(
+              (node) =>
+                (node.status === "in_progress" || node.status === "starting") &&
+                node.childThreadId,
+            )
+            .map((node) => node.childThreadId!);
+          for (const childId of childIds) {
+            try {
+              await bb.sdk.threads.stop({ threadId: childId });
+            } catch (error) {
+              const reason = error instanceof Error ? error.message : String(error);
+              throw new Error(
+                `Cannot stop Harness: failed to stop child ${childId}. ${reason}`,
+              );
+            }
+          }
+          const settle = db.transaction(() => {
+            for (const candidate of candidates) {
+              for (const node of nodesOf(candidate.id)) {
+                if (node.status === "in_progress" || node.status === "starting") {
+                  updateNodeStatus.run("skipped", node.id, candidate.id);
+                }
+              }
+            }
+            deleteArc.run(threadId);
+          });
+          settle();
+          for (const childId of childIds) {
+            await closeAttemptForChild(childId);
+          }
+        } else {
+          deleteArc.run(threadId);
+        }
       }
       publish();
       return;

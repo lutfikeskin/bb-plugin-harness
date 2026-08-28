@@ -73,7 +73,7 @@ Extend definitions additively:
 - Custom policies keep execution, artifacts, and maxCorrections. Phase skill fields and `promoteMode: ask` are ignored; only `always`/`off` remain.
 - Start claims the arc with a conditional insert and binds `arcs.plan_id`. Artifact refs stay under `artifacts/`.
 - Plugin RPC is full-trust local UI/CLI, not a tenant auth boundary. Plan RPCs require the owning parent thread from `threads.get`.
-- Child spawn claims pending→starting before any await. Routing is resolved before spawn; attach is a sync CAS. Start/Stop/Skip serialize per parent thread. Failed-child reconcile is CAS on status+child id.
+- Child spawn claims pending→starting before any await. Routing is resolved before spawn; attach is a sync CAS. Start/Stop/Skip serialize per parent thread. Failed-child reconcile is CAS on status+child id. Legacy null `arcs.plan_id` Stop settles every live candidate child before deleting the arc.
 - Inherited attempt model uses `threads.defaultExecutionOptions` when present; otherwise `inherited-unknown` with null provider/model.
 
 ## Non-goals
