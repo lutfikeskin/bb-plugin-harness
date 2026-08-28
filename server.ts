@@ -1515,6 +1515,7 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error("Need a parent thread to spawn a child for this node's execution mode.");
     }
 
+    let spawnedId: string | null = null;
     try {
       const parent = await bb.sdk.threads.get({ threadId: parentId });
       if (!parent.environmentId) {
@@ -1522,6 +1523,15 @@ export default async function plugin(bb: BbPluginApi) {
         throw new Error("Parent thread has no environment; cannot spawn a child.");
       }
       const choice = resolvedChoice(nodes, node);
+      // Routing must be resolved before spawn so attach can run with no await
+      // between the spawn result and the child row.
+      const routing = choice
+        ? {
+            providerId: choice.providerId,
+            model: choice.model,
+            source: "explicit-routing",
+          }
+        : await inheritedAttemptRouting(parent.id, parent.providerId);
       const title = `${PHASE_COPY[node.phase].label}: ${node.title}`.slice(0, 80);
       const child = await bb.sdk.threads.spawn({
         prompt: nodePrompt(node, node.phase),
@@ -1550,13 +1560,7 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : {}),
       });
-      const routing = choice
-        ? {
-            providerId: choice.providerId,
-            model: choice.model,
-            source: "explicit-routing",
-          }
-        : await inheritedAttemptRouting(parent.id, parent.providerId);
+      spawnedId = child.id;
       const attached = db.transaction(() => {
         const result = attachStartingChild.run(child.id, node.id, planId);
         if (result.changes !== 1) return false;
@@ -1582,11 +1586,20 @@ export default async function plugin(bb: BbPluginApi) {
         return true;
       })();
       if (!attached) {
-        recoverClaim();
         throw new Error("Node start claim was lost before the child could be attached.");
       }
     } catch (error) {
       recoverClaim();
+      if (spawnedId) {
+        try {
+          await bb.sdk.threads.stop({ threadId: spawnedId });
+        } catch (stopError) {
+          const reason = stopError instanceof Error ? stopError.message : String(stopError);
+          throw new Error(
+            `Child ${spawnedId} was spawned but not attached and could not be stopped. ${reason}`,
+          );
+        }
+      }
       throw error;
     }
     publish();
@@ -1855,10 +1868,12 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
     const node = lookupPlanNode(planId, nodeId);
-    if (
-      (node.status === "in_progress" || node.status === "starting") &&
-      node.childThreadId
-    ) {
+    if (node.status === "starting") {
+      throw new Error(
+        `Cannot skip ${node.id} while it is starting. Retry after the child is attached.`,
+      );
+    }
+    if (node.status === "in_progress" && node.childThreadId) {
       await stopChildThread(node.childThreadId, "skip this node");
     }
     updateNodeStatus.run("skipped", node.id, planId);
@@ -2107,7 +2122,6 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function stopRun(threadId: string, claimedProjectId?: string): Promise<void> {
     const projectId = await resolveProjectId(threadId, claimedProjectId);
-    const stoppedHistorical = await stopHistoricalRun(threadId);
     const arc = readArc(threadId);
     if (arc) {
       if (arc.project_id !== projectId) {
@@ -2115,10 +2129,23 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const plan = planForThread(arc.project_id, threadId);
       if (plan) {
-        await stopLiveChildren(nodesOf(plan.id), "stop Harness");
+        const starting = nodesOf(plan.id).find((node) => node.status === "starting");
+        if (starting) {
+          throw new Error(
+            `Cannot stop Harness while ${starting.id} is starting. Retry after the child is attached.`,
+          );
+        }
+      }
+    }
+    const stoppedHistorical = await stopHistoricalRun(threadId);
+    if (arc) {
+      const plan = planForThread(arc.project_id, threadId);
+      if (plan) {
+        const live = nodesOf(plan.id);
+        await stopLiveChildren(live, "stop Harness");
         const settle = db.transaction(() => {
           for (const node of nodesOf(plan.id)) {
-            if (node.status === "in_progress" || node.status === "starting") {
+            if (node.status === "in_progress") {
               updateNodeStatus.run("skipped", node.id, plan.id);
             }
           }
