@@ -1,25 +1,36 @@
 ---
 name: harness-arc
-description: Drive work through the Harness plugin's Explore → Plan → Worker → Critic → Promote arc and its one-node-at-a-time DAG. Use when the user mentions the harness, the five-phase arc, prewalk, DAG plans, artifacts/ discipline, or asks to advance, rewind, or plan the current thread.
+description: Drive work through the Harness plugin's Explore → Plan → Worker → Critic → Promote arc and its one-node-at-a-time DAG. Use when the user mentions the harness, Standard Harness, Milestone Pipeline, custom Harnesses, prewalk, DAG plans, artifacts/ discipline, or asks to advance, rewind, or plan the current thread.
 ---
 
 # Harness arc
 
 The Harness plugin is the fulcrum between expectations and the model. Roles stay isolated. A prompt that plans, implements, and critiques itself confuses its own objectives.
 
-Arc:
+Ordinary chats stay ordinary until the operator explicitly starts a Harness.
+
+## Standard Harness (default)
 
 1. **Explore** — map the problem. Do not implement yet. Stays on the parent thread.
-2. **Plan** — freeze a plan packet. v1 always continues to one Worker. Stays on a child thread.
-3. **Worker** — implement the approved plan as one bounded unit. Spawns a child thread.
+2. **Plan** — freeze an explicit DAG. Stays on the parent thread.
+3. **Worker** — implement one node. Spawns a child thread.
 4. **Critic** — simplify and push back. Returning to Worker is normal. Spawns a child thread.
 5. **Promote** — the job is unfinished until you communicate it. Spawns a child thread.
+
+Custom Harnesses clone this five-arc shape. Name, description, and per-phase instructions can change; the engine cannot. Starting snapshots the definition into the plan so later edits do not rewrite in-flight work.
+
+## Milestone Pipeline (optional)
+
+Never auto-selected. Scout, optional Specialist, Planner approval, one fixed Worker + Tester, Reviewer, one bounded correction, Promote. Every executable stage is a visible child with structured packets.
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
 | `bb harness status` | Current phase, resolved model, next DAG node |
+| `bb harness start --task "<text>"` | Start Standard Harness |
+| `bb harness start --task "<text>" --harness <id>` | Start a named Harness |
+| `bb harness start --task "<text>" --milestone` | Start Milestone Pipeline |
 | `bb harness advance` | Move one phase forward |
 | `bb harness rewind` | Move one phase back (critic → worker) |
 | `bb harness set-phase <phase>` | Jump to explore\|plan\|worker\|critic\|promote |
@@ -33,7 +44,7 @@ Arc:
 
 Pass `--thread <id>` when you are not already inside that thread. Add `--json` when the output drives code.
 
-Native tools: `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`.
+Native tools: `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`. Milestone children also get `harness_submit_result`.
 
 ## Procedure
 
@@ -46,12 +57,8 @@ Native tools: `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harn
 
 ## Role routing
 
-Settings → Role routing picks a real provider and model for:
+Settings → Role routing picks a real provider and model for Explore/Plan (parent on Standard), Worker, Critic/Reviewer, and Promote.
 
-- Explore / Plan (advisory — parent composer)
-- Worker first node / later worker nodes
-- Critic / Promote
-
-A DAG node can override that slot. Unset means inherit the parent thread's provider/model. Starting a worker/critic/promote node still spawns a child for isolation.
+A DAG node can override that slot. Unset means inherit the parent thread's provider/model.
 
 Do not auto-complete a node when the child goes idle. The operator clicks Done.

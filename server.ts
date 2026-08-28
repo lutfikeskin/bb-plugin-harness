@@ -34,6 +34,21 @@ import {
   type RoleRouting,
 } from "./lib/harness";
 import {
+  CUSTOM_HARNESSES_KEY,
+  STANDARD_HARNESS_ID,
+  applyHarnessPatch,
+  builtinHarnesses,
+  cloneStandardHarness,
+  isReservedHarnessId,
+  parseCustomHarnesses,
+  parseHarnessDefinition,
+  resolveHarnessId,
+  snapshotHarness,
+  standardHarnessDefinition,
+  toHarnessRef,
+  type HarnessDefinition,
+} from "./lib/definitions";
+import {
   AGENT_ROLES,
   LIVE_RUN_STATUSES,
   MILESTONE_PIPELINE_ID,
@@ -123,6 +138,47 @@ const planNodeSchema = z.object({
   child: childThreadSchema.nullable(),
 });
 
+const phaseSpecSchema = z.object({
+  title: z.string(),
+  detail: z.string(),
+});
+const harnessDefinitionSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  kind: z.enum(["builtin", "custom"]),
+  engine: z.enum(["manual", "milestone"]),
+  phases: z.object({
+    explore: phaseSpecSchema,
+    plan: phaseSpecSchema,
+    worker: phaseSpecSchema,
+    critic: phaseSpecSchema,
+    promote: phaseSpecSchema,
+  }),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
+const harnessRefSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string(),
+  kind: z.enum(["builtin", "custom"]),
+  engine: z.enum(["manual", "milestone"]),
+});
+const harnessDraftSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  description: z.string().max(500).optional(),
+  phases: z
+    .object({
+      explore: phaseSpecSchema.partial().optional(),
+      plan: phaseSpecSchema.partial().optional(),
+      worker: phaseSpecSchema.partial().optional(),
+      critic: phaseSpecSchema.partial().optional(),
+      promote: phaseSpecSchema.partial().optional(),
+    })
+    .optional(),
+});
+
 const planMetaSchema = z.object({
   id: z.string(),
   projectId: z.string(),
@@ -132,10 +188,12 @@ const planMetaSchema = z.object({
   updatedAt: z.number(),
   nodeCount: z.number(),
   doneCount: z.number(),
+  harnessId: z.string().nullable(),
 });
 
 const planFullSchema = planMetaSchema.extend({
   nodes: z.array(planNodeSchema),
+  harnessSnapshot: harnessDefinitionSchema.nullable(),
 });
 
 export type ArcDto = z.infer<typeof arcSchema>;
@@ -222,6 +280,8 @@ const statusSchema = z.object({
   prewalkEnabled: z.boolean(),
   routing: roleRoutingSchema,
   run: runDetailsSchema.nullable(),
+  harness: harnessRefSchema.nullable(),
+  customHarnesses: z.array(harnessDefinitionSchema),
 });
 
 const startRunInputSchema = z.object({
@@ -233,7 +293,8 @@ const startRunInputSchema = z.object({
   protectedPaths: z.array(z.string().trim().min(1).max(500)).max(50).optional(),
   runScout: z.boolean().optional(),
   specialistQuestion: z.string().trim().max(4000).optional(),
-  templateId: z.literal(MILESTONE_PIPELINE_ID).optional(),
+  harnessId: z.string().trim().min(1).max(64).optional(),
+  templateId: z.string().trim().min(1).max(64).optional(),
   routingOverrides: roleRoutingSchema.optional(),
   nodeRouting: z.record(z.string(), executionChoiceSchema).optional(),
 });
@@ -396,6 +457,22 @@ export const rpcContract = defineRpcContract({
     }),
     output: z.object({ run: runDetailsSchema.nullable() }),
   },
+  listHarnesses: {
+    input: z.object({}),
+    output: z.object({ harnesses: z.array(harnessDefinitionSchema) }),
+  },
+  createHarness: {
+    input: harnessDraftSchema,
+    output: z.object({ harness: harnessDefinitionSchema }),
+  },
+  updateHarness: {
+    input: harnessDraftSchema.extend({ id: z.string().trim().min(1).max(64) }),
+    output: z.object({ harness: harnessDefinitionSchema }),
+  },
+  deleteHarness: {
+    input: z.object({ id: z.string().trim().min(1).max(64) }),
+    output: z.object({ ok: z.literal(true) }),
+  },
 });
 
 type ArcRow = {
@@ -404,6 +481,7 @@ type ArcRow = {
   phase: string;
   note: string;
   updated_at: number;
+  harness_id: string | null;
 };
 
 type PlanRow = {
@@ -413,6 +491,8 @@ type PlanRow = {
   name: string;
   created_at: number;
   updated_at: number;
+  harness_id: string | null;
+  harness_snapshot: string | null;
 };
 
 type NodeRow = {
@@ -502,7 +582,7 @@ function usage(): string {
     "  bb harness advance [--thread <id>] [--json]",
     "  bb harness rewind [--thread <id>] [--json]",
     "  bb harness set-phase <explore|plan|worker|critic|promote> [--thread <id>] [--json]",
-    "  bb harness start --task <text> [--no-scout] [--exec-plan <path>] [--branch <name>] [--protected a,b] [--specialist <q>] [--thread <id>] [--json]",
+    "  bb harness start --task <text> [--harness <id>] [--milestone] [--no-scout] [--exec-plan <path>] [--branch <name>] [--protected a,b] [--specialist <q>] [--thread <id>] [--json]",
     "  bb harness stop [--thread <id>] [--json]",
     "  bb harness approve-plan [--thread <id>] [--json]",
     "  bb harness approve-correction [--thread <id>] [--json]",
@@ -609,6 +689,9 @@ export default async function plugin(bb: BbPluginApi) {
        UNIQUE(run_node_id, version)
      )`,
     `CREATE INDEX IF NOT EXISTS harness_packets_run_idx ON harness_packets(run_id, created_at)`,
+    `ALTER TABLE plans ADD COLUMN harness_id TEXT`,
+    `ALTER TABLE plans ADD COLUMN harness_snapshot TEXT`,
+    `ALTER TABLE arcs ADD COLUMN harness_id TEXT`,
   ]);
 
   const settings = bb.settings.define({
@@ -635,14 +718,16 @@ export default async function plugin(bb: BbPluginApi) {
 
   const selectArc = db.prepare("SELECT * FROM arcs WHERE thread_id = ?");
   const upsertArc = db.prepare(
-    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at)
-     VALUES (@thread_id, @project_id, @phase, @note, @updated_at)
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id)
      ON CONFLICT(thread_id) DO UPDATE SET
        project_id = excluded.project_id,
        phase = excluded.phase,
        note = excluded.note,
-       updated_at = excluded.updated_at`,
+       updated_at = excluded.updated_at,
+       harness_id = excluded.harness_id`,
   );
+  const deleteArc = db.prepare("DELETE FROM arcs WHERE thread_id = ?");
   const selectPlan = db.prepare("SELECT * FROM plans WHERE id = ?");
   const selectPlans = db.prepare(
     `SELECT * FROM plans WHERE project_id = ?
@@ -653,11 +738,14 @@ export default async function plugin(bb: BbPluginApi) {
      ORDER BY updated_at DESC`,
   );
   const insertPlan = db.prepare(
-    `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at)
-     VALUES (@id, @project_id, @thread_id, @name, @created_at, @updated_at)`,
+    `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at, harness_id, harness_snapshot)
+     VALUES (@id, @project_id, @thread_id, @name, @created_at, @updated_at, @harness_id, @harness_snapshot)`,
   );
   const touchPlan = db.prepare(
     "UPDATE plans SET updated_at = ? WHERE id = ?",
+  );
+  const updatePlanSnapshot = db.prepare(
+    "UPDATE plans SET harness_id = ?, harness_snapshot = ?, updated_at = ? WHERE id = ?",
   );
   const selectNodes = db.prepare(
     "SELECT * FROM plan_nodes WHERE plan_id = ? ORDER BY sort_order ASC",
@@ -749,12 +837,41 @@ export default async function plugin(bb: BbPluginApi) {
   let currentRouting: RoleRouting = parseRoleRouting(
     await bb.storage.kv.get(ROUTING_KEY),
   );
+  let customHarnesses: HarnessDefinition[] = parseCustomHarnesses(
+    await bb.storage.kv.get(CUSTOM_HARNESSES_KEY),
+  );
 
   async function saveRouting(next: RoleRouting): Promise<RoleRouting> {
     currentRouting = next;
     await bb.storage.kv.set(ROUTING_KEY, next);
     publish();
     return next;
+  }
+
+  async function saveCustomHarnesses(
+    next: HarnessDefinition[],
+  ): Promise<HarnessDefinition[]> {
+    customHarnesses = next;
+    await bb.storage.kv.set(CUSTOM_HARNESSES_KEY, next);
+    publish();
+    return next;
+  }
+
+  function catalogHarnesses(): HarnessDefinition[] {
+    return [...builtinHarnesses(), ...customHarnesses];
+  }
+
+  function findHarness(id: string, snapshot?: HarnessDefinition | null): HarnessDefinition | null {
+    const fromCatalog = catalogHarnesses().find((item) => item.id === id);
+    if (fromCatalog) return fromCatalog;
+    if (snapshot && snapshot.id === id) return snapshot;
+    return null;
+  }
+
+  function requireHarness(id: string): HarnessDefinition {
+    const found = findHarness(id);
+    if (!found) throw new Error(`Unknown Harness ${id}.`);
+    return found;
   }
 
   function publish(): void {
@@ -1086,11 +1203,68 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function startRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
-    const parent = await bb.sdk.threads.get({ threadId: input.threadId });
-    const projectId = input.projectId ?? parent.projectId;
-    if (selectLiveRun.get(input.threadId)) {
+    const harnessId = resolveHarnessId(input);
+    const definition = requireHarness(harnessId);
+    if (definition.engine === "milestone") {
+      await startMilestoneRun(input);
+      return;
+    }
+    await startManualHarness(input, definition);
+  }
+
+  function assertCanStart(threadId: string): void {
+    if (selectLiveRun.get(threadId) || readArc(threadId)) {
       throw new Error("A Harness run is already active on this thread.");
     }
+  }
+
+  async function startManualHarness(
+    input: z.infer<typeof startRunInputSchema>,
+    definition: HarnessDefinition,
+  ): Promise<void> {
+    const parent = await bb.sdk.threads.get({ threadId: input.threadId });
+    const projectId = input.projectId ?? parent.projectId;
+    assertCanStart(input.threadId);
+    const now = Date.now();
+    const frozen = snapshotHarness(definition);
+    const row: PlanRow = {
+      id: shortId(),
+      project_id: projectId,
+      thread_id: input.threadId,
+      name: input.objective.trim().slice(0, 200),
+      created_at: now,
+      updated_at: now,
+      harness_id: frozen.id,
+      harness_snapshot: JSON.stringify(frozen),
+    };
+    const insertAll = db.transaction(() => {
+      insertPlan.run(row);
+      insertSeedNodes(row.id, frozen);
+      upsertArc.run({
+        thread_id: input.threadId,
+        project_id: projectId,
+        phase: "explore",
+        note: input.objective.trim(),
+        updated_at: now,
+        harness_id: frozen.id,
+      });
+    });
+    try {
+      insertAll();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("UNIQUE")) {
+        throw new Error("A Harness run is already active on this thread.");
+      }
+      throw error;
+    }
+    publish();
+  }
+
+  async function startMilestoneRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
+    const parent = await bb.sdk.threads.get({ threadId: input.threadId });
+    const projectId = input.projectId ?? parent.projectId;
+    assertCanStart(input.threadId);
     if (!parent.environmentId) {
       throw new Error("Parent thread has no environment; cannot start a Harness run.");
     }
@@ -1178,26 +1352,34 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function stopRun(threadId: string): Promise<void> {
     const run = latestRunFor(threadId);
-    if (!run) throw new Error("No Harness run on this thread.");
-    if (isTerminalRunStatus(run.status)) return;
-    run.status = "cancelled";
-    run.completedAt = Date.now();
-    persistRun(run);
-    for (const node of runNodesOf(run.id)) {
-      if (node.status === "in_progress" || node.status === "starting") {
-        node.status = "failed";
-        node.completedAt = Date.now();
-        persistRunNode(node);
-        if (node.childThreadId) {
-          try {
-            await bb.sdk.threads.stop({ threadId: node.childThreadId });
-          } catch {
-            // Child stop is best-effort; the run is already terminal.
+    if (run && !isTerminalRunStatus(run.status)) {
+      run.status = "cancelled";
+      run.completedAt = Date.now();
+      persistRun(run);
+      for (const node of runNodesOf(run.id)) {
+        if (node.status === "in_progress" || node.status === "starting") {
+          node.status = "failed";
+          node.completedAt = Date.now();
+          persistRunNode(node);
+          if (node.childThreadId) {
+            try {
+              await bb.sdk.threads.stop({ threadId: node.childThreadId });
+            } catch {
+              // Child stop is best-effort; the run is already terminal.
+            }
           }
         }
       }
+      publish();
+      return;
     }
-    publish();
+    if (readArc(threadId)) {
+      deleteArc.run(threadId);
+      publish();
+      return;
+    }
+    if (run && isTerminalRunStatus(run.status)) return;
+    throw new Error("No Harness run on this thread.");
   }
 
   async function approvePlan(threadId: string): Promise<void> {
@@ -1370,6 +1552,15 @@ export default async function plugin(bb: BbPluginApi) {
     return (selectNodes.all(planId) as NodeRow[]).map(toNode);
   }
 
+  function snapshotOf(row: PlanRow): HarnessDefinition | null {
+    if (!row.harness_snapshot) return null;
+    try {
+      return parseHarnessDefinition(JSON.parse(row.harness_snapshot));
+    } catch {
+      return null;
+    }
+  }
+
   function toMeta(row: PlanRow, nodes = nodesOf(row.id)) {
     return {
       id: row.id,
@@ -1380,6 +1571,7 @@ export default async function plugin(bb: BbPluginApi) {
       updatedAt: row.updated_at,
       nodeCount: nodes.length,
       doneCount: nodes.filter((node) => node.status === "done").length,
+      harnessId: row.harness_id ?? null,
     };
   }
 
@@ -1430,7 +1622,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function toFull(row: PlanRow) {
     const nodes = nodesOf(row.id);
-    return { ...toMeta(row, nodes), nodes: await enrichNodes(nodes) };
+    return {
+      ...toMeta(row, nodes),
+      nodes: await enrichNodes(nodes),
+      harnessSnapshot: snapshotOf(row),
+    };
   }
 
   function requirePlan(id: string): PlanRow {
@@ -1478,13 +1674,16 @@ export default async function plugin(bb: BbPluginApi) {
     projectId: string,
     phase: Phase,
     note = "",
+    harnessId: string | null = null,
   ): ArcRow {
+    const existing = readArc(threadId);
     const row: ArcRow = {
       thread_id: threadId,
       project_id: projectId,
       phase,
       note,
       updated_at: Date.now(),
+      harness_id: harnessId ?? existing?.harness_id ?? STANDARD_HARNESS_ID,
     };
     upsertArc.run(row);
     publish();
@@ -1539,8 +1738,16 @@ export default async function plugin(bb: BbPluginApi) {
           note: "",
           updatedAt: 0,
         };
-    const planRow = planForThread(projectId, ownerId);
+    const planRow = existingArc ? planForThread(projectId, ownerId) : null;
     const plan = planRow ? await toFull(planRow) : null;
+    const snapshot = planRow ? snapshotOf(planRow) : null;
+    const harnessId = run
+      ? MILESTONE_PIPELINE_ID
+      : existingArc?.harness_id ?? snapshot?.id ?? null;
+    const harnessDef = harnessId
+      ? findHarness(harnessId, snapshot) ?? snapshot ?? null
+      : null;
+    const harness = existingArc || run ? (harnessDef ? toHarnessRef(harnessDef) : null) : null;
     const nextNode = plan ? nextWorkNode(plan.nodes) : null;
     const workerIndex =
       nextNode && plan ? workerOrdinal(plan.nodes, nextNode.id) : 0;
@@ -1559,6 +1766,8 @@ export default async function plugin(bb: BbPluginApi) {
       prewalkEnabled: currentSettings.prewalkEnabled,
       routing: currentRouting,
       run: run ? await toRunDetails(run) : null,
+      harness,
+      customHarnesses,
     };
   }
 
@@ -1693,8 +1902,9 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  function insertSeedNodes(planId: string): void {
-    for (const [index, node] of seedArcNodes().entries()) {
+  function insertSeedNodes(planId: string, definition?: HarnessDefinition): void {
+    const source = definition ?? standardHarnessDefinition();
+    for (const [index, node] of seedArcNodes(planId, source.phases).entries()) {
       insertNode.run({
         id: node.id,
         plan_id: planId,
@@ -1708,6 +1918,15 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  function persistPlanSnapshot(planId: string, definition: HarnessDefinition): void {
+    updatePlanSnapshot.run(
+      definition.id,
+      JSON.stringify(snapshotHarness(definition)),
+      Date.now(),
+      planId,
+    );
+  }
+
   function uniqueNodeId(planId: string, title: string): string {
     const existing = new Set(nodesOf(planId).map((node) => node.id));
     const base = slugId(title);
@@ -1718,7 +1937,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function formatStatus(status: Awaited<ReturnType<typeof statusPayload>>): string {
-    const { arc, nextNode, tier, plan, run } = status;
+    const { arc, nextNode, tier, plan, run, harness } = status;
     if (run) {
       const current = run.currentNode;
       const lines = [
@@ -1731,13 +1950,16 @@ export default async function plugin(bb: BbPluginApi) {
       if (current?.childThreadId) lines.push(`Child: ${current.childThreadId}`);
       return lines.join("\n");
     }
+    if (!harness) {
+      return `Harness: inactive (${arc.threadId})`;
+    }
     const copy = PHASE_COPY[arc.phase];
     const choice = nextNode
       ? resolvedChoice(plan?.nodes ?? [], nextNode)
       : currentRouting[routingSlotFor(arc.phase, 0)];
     const lines = [
-      `Harness: inactive (${arc.threadId})`,
-      `Legacy arc: ${copy.label}`,
+      `Harness: ${harness.name} (${arc.threadId})`,
+      `Phase: ${copy.label}`,
       copy.summary,
       `Model: ${formatChoice(choice)}  (prewalk ${tier})`,
     ];
@@ -1810,9 +2032,9 @@ export default async function plugin(bb: BbPluginApi) {
           "Explore → Plan → Worker → Critic → Promote.",
           "",
           "- Isolate roles. A prompt that plans, implements, and critiques itself confuses its own objectives.",
-          "- v1 runs one fixed Worker + Tester node after plan approval.",
-          "- Every role spawns a visible child thread.",
-          "- Pick a provider/model per role in plugin settings, or override it on a run node.",
+          "- Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn visible children.",
+          "- Standard Harness is the default. Milestone Pipeline is optional.",
+          "- Pick a provider/model per role in plugin settings, or override it on a DAG node.",
           "- Keep auditable outputs in `artifacts/`. TUIs share this harness.",
           "",
           "Commands: `bb harness status|advance|set-phase|init|plan …`",
@@ -1914,9 +2136,14 @@ export default async function plugin(bb: BbPluginApi) {
         name,
         created_at: now,
         updated_at: now,
+        harness_id: STANDARD_HARNESS_ID,
+        harness_snapshot: null,
       };
       insertPlan.run(row);
-      if (seedArc !== false) insertSeedNodes(row.id);
+      if (seedArc !== false) {
+        insertSeedNodes(row.id);
+        persistPlanSnapshot(row.id, standardHarnessDefinition(now));
+      }
       publish();
       return { plan: await toFull(row) };
     },
@@ -2031,6 +2258,35 @@ export default async function plugin(bb: BbPluginApi) {
         : latestRunFor(ownerThreadId(threadId));
       return { run: run ? await toRunDetails(run) : null };
     },
+    listHarnesses: () => ({ harnesses: catalogHarnesses() }),
+    createHarness: async (draft) => {
+      const created = cloneStandardHarness(draft, () => randomUUID());
+      if (customHarnesses.some((item) => item.id === created.id)) {
+        throw new Error(`Harness ${created.id} already exists.`);
+      }
+      await saveCustomHarnesses([...customHarnesses, created]);
+      return { harness: created };
+    },
+    updateHarness: async ({ id, ...draft }) => {
+      const current = customHarnesses.find((item) => item.id === id);
+      if (!current) {
+        if (isReservedHarnessId(id)) throw new Error("Built-in Harnesses are immutable.");
+        throw new Error(`Unknown Harness ${id}.`);
+      }
+      const next = applyHarnessPatch(current, draft);
+      await saveCustomHarnesses(
+        customHarnesses.map((item) => (item.id === id ? next : item)),
+      );
+      return { harness: next };
+    },
+    deleteHarness: async ({ id }) => {
+      if (isReservedHarnessId(id)) throw new Error("Built-in Harnesses are immutable.");
+      if (!customHarnesses.some((item) => item.id === id)) {
+        throw new Error(`Unknown Harness ${id}.`);
+      }
+      await saveCustomHarnesses(customHarnesses.filter((item) => item.id !== id));
+      return { ok: true as const };
+    },
   });
 
   function takeFlag(argv: string[], name: string): boolean {
@@ -2045,7 +2301,7 @@ export default async function plugin(bb: BbPluginApi) {
     const out: string[] = [];
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i]!;
-      if (arg === "--json" || arg === "--seed" || arg === "--no-seed" || arg === "--no-scout") continue;
+      if (arg === "--json" || arg === "--seed" || arg === "--no-seed" || arg === "--no-scout" || arg === "--milestone") continue;
       if (
         arg === "--thread" ||
         arg === "--phase" ||
@@ -2055,7 +2311,8 @@ export default async function plugin(bb: BbPluginApi) {
         arg === "--branch" ||
         arg === "--protected" ||
         arg === "--specialist" ||
-        arg === "--node"
+        arg === "--node" ||
+        arg === "--harness"
       ) {
         i += 1;
         continue;
@@ -2074,7 +2331,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "rewind", summary: "Move the arc one phase back", usage: "bb harness rewind [--thread <id>] [--json]" },
       { name: "set-phase", summary: "Jump to a named phase", usage: "bb harness set-phase <phase> [--thread <id>] [--json]" },
       { name: "init", summary: "Scaffold artifacts/, plans/, and HARNESS.md in the workspace", usage: "bb harness init [--thread <id>] [--json]" },
-      { name: "start", summary: "Explicitly start a Harness run on this thread", usage: "bb harness start --task <text> [--no-scout] [--json]" },
+      { name: "start", summary: "Start Standard Harness by default, or a named Harness", usage: "bb harness start --task <text> [--harness <id>|--milestone] [--json]" },
       { name: "stop", summary: "Cancel the active Harness run", usage: "bb harness stop [--thread <id>] [--json]" },
       { name: "approve-plan", summary: "Approve the Planner packet and start Worker", usage: "bb harness approve-plan [--thread <id>] [--json]" },
       { name: "approve-correction", summary: "Start the one allowed correction Worker", usage: "bb harness approve-correction [--thread <id>] [--json]" },
@@ -2130,6 +2387,8 @@ export default async function plugin(bb: BbPluginApi) {
               threadId: threadId!,
               projectId: ctx.projectId ?? undefined,
               objective: task,
+              harnessId: takeOption(argv, "--harness")
+                ?? (takeFlag(argv, "--milestone") ? MILESTONE_PIPELINE_ID : undefined),
               branch: takeOption(argv, "--branch"),
               execPlanPath: takeOption(argv, "--exec-plan"),
               protectedPaths: (takeOption(argv, "--protected") ?? "")
@@ -2292,9 +2551,14 @@ export default async function plugin(bb: BbPluginApi) {
                   name,
                   created_at: now,
                   updated_at: now,
+                  harness_id: STANDARD_HARNESS_ID,
+                  harness_snapshot: null,
                 };
                 insertPlan.run(row);
-                if (!takeFlag(argv, "--no-seed")) insertSeedNodes(row.id);
+                if (!takeFlag(argv, "--no-seed")) {
+                  insertSeedNodes(row.id);
+                  persistPlanSnapshot(row.id, standardHarnessDefinition(now));
+                }
                 publish();
                 const plan = await toFull(row);
                 return reply(plan, formatPlan(plan));
@@ -2453,9 +2717,14 @@ export default async function plugin(bb: BbPluginApi) {
         name,
         created_at: now,
         updated_at: now,
+        harness_id: STANDARD_HARNESS_ID,
+        harness_snapshot: null,
       };
       insertPlan.run(row);
-      if (seedArc !== false) insertSeedNodes(row.id);
+      if (seedArc !== false) {
+        insertSeedNodes(row.id);
+        persistPlanSnapshot(row.id, standardHarnessDefinition(now));
+      }
       for (const node of nodes ?? []) {
         const id = uniqueNodeId(row.id, node.title);
         insertNode.run({
@@ -2584,6 +2853,26 @@ export default async function plugin(bb: BbPluginApi) {
         instructions: participantInstruction("operator"),
       };
     }
+    const arc = readArc(context.thread.id);
+    if (arc) {
+      const phase = isPhase(arc.phase) ? arc.phase : "explore";
+      return {
+        tools: [
+          "harness_get_arc",
+          "harness_advance",
+          "harness_create_plan",
+          "harness_next_node",
+          "harness_complete_node",
+        ],
+        skills: [],
+        instructions: [
+          `You are on the ${PHASE_COPY[phase].label} phase of an explicit Harness.`,
+          PHASE_COPY[phase].summary,
+          "Explore and Plan stay on this parent thread. Worker, Critic, and Promote spawn visible children.",
+          "Work one DAG node at a time.",
+        ].join(" "),
+      };
+    }
     return { tools: [], skills: [] };
   });
 
@@ -2598,8 +2887,11 @@ export default async function plugin(bb: BbPluginApi) {
       return null;
     }
     const live = liveRunFor(threadId);
-    if (!live) return null;
-    return participantInstruction("operator");
+    if (live) return participantInstruction("operator");
+    const arc = readArc(threadId);
+    if (!arc) return null;
+    const phase = isPhase(arc.phase) ? arc.phase : "explore";
+    return `${PHASE_COPY[phase].label}: ${PHASE_COPY[phase].summary} Explore and Plan stay on the parent. Worker, Critic, and Promote spawn children.`;
   });
 
   const refreshChild = ({ thread }: { thread: { id: string } }) => {

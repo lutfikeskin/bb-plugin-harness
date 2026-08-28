@@ -6,6 +6,7 @@ import {
 } from "@get-bb/plugin-sdk/testing";
 import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import plugin from "../server";
+import { MILESTONE_PIPELINE_ID } from "../lib/run-engine";
 
 const PROJECT = "proj_test";
 const PARENT = "thr_parent";
@@ -93,6 +94,7 @@ async function startDefault(host: FakePluginHost, extra: Record<string, unknown>
     threadId: PARENT,
     projectId: PROJECT,
     objective: "Ship the opt-in run engine",
+    harnessId: MILESTONE_PIPELINE_ID,
     ...extra,
   }) as Promise<{ run: { id: string; status: string; nodes: Array<Record<string, unknown>> } | null }>;
 }

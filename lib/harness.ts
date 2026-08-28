@@ -35,28 +35,28 @@ export const ROUTING_SLOT_COPY: Record<
   { label: string; hint: string }
 > = {
   explore: {
-    label: "Scout / Specialist",
-    hint: "Explore-arc children. Scout maps the problem; Specialist answers one question. Unset inherits the parent thread.",
+    label: "Explore / Scout",
+    hint: "Explore stays on the parent for Standard Harness. Milestone Scout/Specialist spawn children. Unset inherits the parent thread.",
   },
   plan: {
-    label: "Planner",
-    hint: "Plan-arc child. Submits a plan packet; the operator must approve before Worker starts.",
+    label: "Plan / Planner",
+    hint: "Plan stays on the parent for Standard Harness. Milestone Planner submits a packet for operator approval.",
   },
   workerFirst: {
-    label: "Worker + Tester (first node)",
-    hint: "First Worker child. Prewalk frontier — usually the expensive model.",
+    label: "Worker (first node)",
+    hint: "First Worker child. On Milestone Pipeline this is Worker + Tester. Prewalk frontier.",
   },
   workerRest: {
-    label: "Worker + Tester (later nodes)",
-    hint: "Later Worker children, including the one-shot correction Worker. Prewalk commodity.",
+    label: "Worker (later nodes)",
+    hint: "Later Worker children, including Milestone's one-shot correction. Prewalk commodity.",
   },
   critic: {
-    label: "Reviewer",
-    hint: "Critic-arc child. Returns APPROVE, CORRECTION_REQUIRED, or BLOCKED.",
+    label: "Critic / Reviewer",
+    hint: "Critic may rewind Worker. Milestone Reviewer returns APPROVE, CORRECTION_REQUIRED, or BLOCKED.",
   },
   promote: {
     label: "Promote",
-    hint: "Promote-arc child. Reports the outcome and stops.",
+    hint: "The job is unfinished until you communicate it. Spawns a child on Standard and Milestone.",
   },
 };
 
@@ -122,7 +122,7 @@ export const PHASE_COPY: Record<
   plan: {
     label: "Plan",
     verb: "Planning",
-    summary: "Turn exploration into an approved plan packet. v1 then runs one Worker.",
+    summary: "Turn exploration into an explicit DAG. Name each node and its dependencies.",
   },
   worker: {
     label: "Worker",
@@ -305,46 +305,53 @@ export function workerOrdinal(nodes: readonly PlanNode[], nodeId: string): numbe
   return workers.findIndex((node) => node.id === nodeId);
 }
 
-export function seedArcNodes(): Array<
-  Omit<PlanNode, "status" | "sortOrder"> & { sortOrder?: number }
-> {
-  return [
-    {
-      id: "explore",
-      title: "Explore the problem",
-      detail: "Read the system. Isolate the real constraint. Do not implement yet.",
-      phase: "explore",
-      deps: [],
-    },
-    {
-      id: "plan",
-      title: "Write the DAG",
-      detail: "Name each node and its dependencies. One node, one outcome.",
-      phase: "plan",
-      deps: ["explore"],
-    },
-    {
-      id: "worker",
-      title: "Implement the next node",
-      detail: "Do one DAG node. Keep auditable output in artifacts/.",
-      phase: "worker",
-      deps: ["plan"],
-    },
-    {
-      id: "critic",
-      title: "Critique and simplify",
-      detail: "Question what shipped. Send work back if it does not hold.",
-      phase: "critic",
-      deps: ["worker"],
-    },
-    {
-      id: "promote",
-      title: "Promote the result",
-      detail: "Tell the people who need to know. A silent ship is unfinished.",
-      phase: "promote",
-      deps: ["critic"],
-    },
-  ];
+export type PhaseSpec = {
+  title: string;
+  detail: string;
+};
+
+export const DEFAULT_PHASE_SPECS: Record<Phase, PhaseSpec> = {
+  explore: {
+    title: "Explore the problem",
+    detail: "Read the system. Isolate the real constraint. Do not implement yet.",
+  },
+  plan: {
+    title: "Write the DAG",
+    detail: "Name each node and its dependencies. One node, one outcome.",
+  },
+  worker: {
+    title: "Implement the next node",
+    detail: "Do one DAG node. Keep auditable output in artifacts/.",
+  },
+  critic: {
+    title: "Critique and simplify",
+    detail: "Question what shipped. Send work back if it does not hold.",
+  },
+  promote: {
+    title: "Promote the result",
+    detail: "Tell the people who need to know. A silent ship is unfinished.",
+  },
+};
+
+export function seedNodeId(planId: string, phase: Phase): string {
+  return `${planId}-${phase}`;
+}
+
+export function seedArcNodes(
+  planId: string,
+  phaseSpecs: Record<Phase, PhaseSpec> = DEFAULT_PHASE_SPECS,
+): Array<Omit<PlanNode, "status" | "sortOrder"> & { sortOrder?: number }> {
+  return PHASES.map((phase, index) => {
+    const spec = phaseSpecs[phase] ?? DEFAULT_PHASE_SPECS[phase];
+    const previous = index > 0 ? PHASES[index - 1]! : null;
+    return {
+      id: seedNodeId(planId, phase),
+      title: spec.title,
+      detail: spec.detail,
+      phase,
+      deps: previous ? [seedNodeId(planId, previous)] : [],
+    };
+  });
 }
 
 export function slugId(title: string): string {

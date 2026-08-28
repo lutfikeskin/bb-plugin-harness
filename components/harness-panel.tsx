@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   useBbContext,
   useBbNavigate,
@@ -7,16 +6,18 @@ import {
   useRealtimeConnectionState,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
-import type { HarnessStatusDto, rpcContract } from "../server";
+import type { HarnessStatusDto, PlanNodeDto, rpcContract } from "../server";
 import {
   PHASES,
   PHASE_COPY,
   formatChoice,
+  isSpawnablePhase,
   routingSlotFor,
   type ExecutionChoice,
   type Phase,
 } from "../lib/harness";
 import { SlotModelPicker } from "./harness-settings";
+import { StartHarnessForm } from "./start-harness-form";
 import {
   MILESTONE_PIPELINE_ID,
   ROLE_TITLE,
@@ -59,14 +60,12 @@ function packetSummary(payload: unknown): string {
   }
 }
 
-function parsePathList(raw: string): string[] {
-  return raw
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-}
-
-function persistedChoice(node: RunNode): ExecutionChoice | null {
+function persistedChoice(
+  node: Pick<
+    RunNode,
+    "providerId" | "model" | "reasoningLevel" | "serviceTier"
+  >,
+): ExecutionChoice | null {
   if (!node.providerId || !node.model || !node.reasoningLevel) return null;
   const choice: ExecutionChoice = {
     providerId: node.providerId,
@@ -77,6 +76,10 @@ function persistedChoice(node: RunNode): ExecutionChoice | null {
     choice.serviceTier = node.serviceTier;
   }
   return choice;
+}
+
+function persistedPlanChoice(node: PlanNodeDto): ExecutionChoice | null {
+  return persistedChoice(node);
 }
 
 function displayChoiceForNode(
@@ -162,7 +165,7 @@ function useHarness(threadId: string | null, projectId: string | null) {
 
   const visibleStatus =
     threadId && status?.threadId === threadId ? status.value : null;
-  return { rpc, status: visibleStatus, error, pending, run };
+  return { rpc, status: visibleStatus, error, pending, run, refetch };
 }
 
 function ArcStrip({ phase }: { phase: Phase }) {
@@ -200,9 +203,11 @@ function ArcStrip({ phase }: { phase: Phase }) {
 function RoutingBand({
   phase,
   routing,
+  engine,
 }: {
   phase: Phase;
   routing: HarnessStatusDto["routing"];
+  engine?: "manual" | "milestone";
 }) {
   const slots = [
     routing.explore,
@@ -211,7 +216,10 @@ function RoutingBand({
     routing.critic,
     routing.promote,
   ] as const;
-  const labels = ["scout", "planner", "worker*", "reviewer", "promote"] as const;
+  const labels =
+    engine === "manual"
+      ? (["explore", "plan", "worker*", "critic", "promote"] as const)
+      : (["scout", "planner", "worker*", "reviewer", "promote"] as const);
   return (
     <div className="mt-2 space-y-1">
       <div className="grid grid-cols-5 gap-1 text-[10px] leading-none text-muted-foreground">
@@ -235,140 +243,6 @@ function RoutingBand({
         {routing.workerRest ? ` (${routing.workerRest.model})` : " (inherit)"}.
       </p>
     </div>
-  );
-}
-
-function StartHarnessForm({
-  pending,
-  disabled,
-  onStart,
-}: {
-  pending: boolean;
-  disabled?: boolean;
-  onStart: (input: {
-    objective: string;
-    templateId: typeof MILESTONE_PIPELINE_ID;
-    runScout: boolean;
-    execPlanPath?: string;
-    branch?: string;
-    protectedPaths?: string[];
-    specialistQuestion?: string;
-  }) => void;
-}) {
-  const formId = useId();
-  const [objective, setObjective] = useState("");
-  const [templateId, setTemplateId] = useState<typeof MILESTONE_PIPELINE_ID>(
-    MILESTONE_PIPELINE_ID,
-  );
-  const [runScout, setRunScout] = useState(true);
-  const [execPlanPath, setExecPlanPath] = useState("");
-  const [branch, setBranch] = useState("");
-  const [protectedPaths, setProtectedPaths] = useState("");
-  const [specialistQuestion, setSpecialistQuestion] = useState("");
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const canStart = objective.trim() !== "" && !pending && !disabled;
-
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    if (!canStart) return;
-    const paths = parsePathList(protectedPaths);
-    onStart({
-      objective: objective.trim(),
-      templateId,
-      runScout,
-      ...(execPlanPath.trim() ? { execPlanPath: execPlanPath.trim() } : {}),
-      ...(branch.trim() ? { branch: branch.trim() } : {}),
-      ...(paths.length > 0 ? { protectedPaths: paths } : {}),
-      ...(specialistQuestion.trim()
-        ? { specialistQuestion: specialistQuestion.trim() }
-        : {}),
-    });
-  };
-
-  return (
-    <form onSubmit={submit} className="mt-4 space-y-3">
-      <div className="space-y-1.5">
-        <label htmlFor={`${formId}-task`} className="text-sm font-medium">
-          Task
-        </label>
-        <textarea
-          id={`${formId}-task`}
-          value={objective}
-          onChange={(event) => setObjective(event.target.value)}
-          placeholder="What should this Harness run accomplish?"
-          rows={4}
-          className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-          disabled={disabled || pending}
-        />
-      </div>
-      <div className="space-y-1.5">
-        <label htmlFor={`${formId}-template`} className="text-sm font-medium">
-          Template
-        </label>
-        <select
-          id={`${formId}-template`}
-          value={templateId}
-          onChange={(event) =>
-            setTemplateId(event.target.value as typeof MILESTONE_PIPELINE_ID)
-          }
-          disabled={disabled || pending}
-          className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
-        >
-          <option value={MILESTONE_PIPELINE_ID}>Milestone Pipeline</option>
-        </select>
-      </div>
-      <label className="flex items-center gap-2 text-sm">
-        <input
-          type="checkbox"
-          checked={runScout}
-          onChange={(event) => setRunScout(event.target.checked)}
-          disabled={disabled || pending}
-        />
-        Run Scout
-      </label>
-      <button
-        type="button"
-        className="text-xs text-muted-foreground underline-offset-2 hover:underline"
-        onClick={() => setShowAdvanced((value) => !value)}
-      >
-        {showAdvanced ? "Hide optional fields" : "Optional fields"}
-      </button>
-      {showAdvanced ? (
-        <div className="space-y-2">
-          <Input
-            value={execPlanPath}
-            onChange={(event) => setExecPlanPath(event.target.value)}
-            placeholder="ExecPlan path"
-            aria-label="ExecPlan path"
-            disabled={disabled || pending}
-          />
-          <Input
-            value={branch}
-            onChange={(event) => setBranch(event.target.value)}
-            placeholder="Branch"
-            aria-label="Branch"
-            disabled={disabled || pending}
-          />
-          <Input
-            value={protectedPaths}
-            onChange={(event) => setProtectedPaths(event.target.value)}
-            placeholder="Protected paths (comma-separated)"
-            aria-label="Protected paths"
-            disabled={disabled || pending}
-          />
-          <Input
-            value={specialistQuestion}
-            onChange={(event) => setSpecialistQuestion(event.target.value)}
-            placeholder="Specialist question"
-            aria-label="Specialist question"
-            disabled={disabled || pending}
-          />
-        </div>
-      ) : null}
-      <Button type="submit" disabled={!canStart}>
-        Start Harness
-      </Button>
-    </form>
   );
 }
 
@@ -494,7 +368,7 @@ function ActiveRunView({
       </p>
       <p className="text-sm text-muted-foreground">{run.taskPacket.objective}</p>
       <ArcStrip phase={phase} />
-      <RoutingBand phase={phase} routing={routing} />
+      <RoutingBand phase={phase} routing={routing} engine="milestone" />
       {run.currentNode ? (
         <p className="rounded-md border border-dashed border-border px-3 py-2 text-sm">
           Current stage:{" "}
@@ -573,6 +447,148 @@ function ActiveRunView({
   );
 }
 
+function ManualHarnessView({
+  status,
+  pending,
+  onAdvance,
+  onRewind,
+  onStop,
+  onStartNode,
+  onCompleteNode,
+  onAddWorker,
+  onSetRouting,
+}: {
+  status: HarnessStatusDto;
+  pending: boolean;
+  onAdvance: () => void;
+  onRewind: () => void;
+  onStop: () => void;
+  onStartNode: (nodeId: string) => void;
+  onCompleteNode: (nodeId: string) => void;
+  onAddWorker: (title: string) => void;
+  onSetRouting: (nodeId: string, choice: ExecutionChoice | null) => void;
+}) {
+  const navigate = useBbNavigate();
+  const [workerTitle, setWorkerTitle] = useState("");
+  const plan = status.plan;
+  const phase = status.arc.phase;
+  return (
+    <div className="mt-4 space-y-3">
+      <p className="text-sm font-medium">
+        Harness · {status.harness?.name ?? "Standard Harness"}
+      </p>
+      <p className="text-sm text-muted-foreground">{status.arc.note || status.harness?.description}</p>
+      <ArcStrip phase={phase} />
+      <RoutingBand phase={phase} routing={status.routing} engine="manual" />
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" disabled={pending} onClick={onAdvance}>
+          Advance
+        </Button>
+        <Button size="sm" variant="outline" disabled={pending} onClick={onRewind}>
+          Rewind
+        </Button>
+        <Button size="sm" variant="destructive" disabled={pending} onClick={onStop}>
+          Stop
+        </Button>
+      </div>
+      <div className="rounded-lg border border-border bg-card">
+        <div className="border-b border-border px-3 py-2">
+          <p className="text-sm font-medium">DAG</p>
+        </div>
+        <ul className="divide-y divide-border">
+          {(plan?.nodes ?? []).map((node) => (
+            <li key={node.id} className="flex flex-col gap-1 px-3 py-2">
+              <div className="flex items-start gap-2">
+                <span className="mt-0.5 font-mono text-xs text-muted-foreground">
+                  {node.status === "done"
+                    ? "[x]"
+                    : node.status === "in_progress"
+                      ? "[>]"
+                      : node.status === "skipped"
+                        ? "[-]"
+                        : "[ ]"}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm">{node.title}</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {node.phase} · {node.id} · {node.status}
+                    {` · ${formatChoice(persistedPlanChoice(node) ?? status.routing[routingSlotFor(node.phase, 0)])}`}
+                  </p>
+                  {node.child ? (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Child {node.child.status}
+                      {node.child.title ? ` · ${node.child.title}` : ""}
+                    </p>
+                  ) : !isSpawnablePhase(node.phase) ? (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Stays on the parent thread
+                    </p>
+                  ) : null}
+                  {node.status === "pending" || node.status === "in_progress" ? (
+                    <div className="mt-2">
+                      <SlotModelPicker
+                        choice={persistedPlanChoice(node)}
+                        disabled={pending}
+                        onChange={(next) => onSetRouting(node.id, next)}
+                      />
+                    </div>
+                  ) : null}
+                </div>
+                <div className="flex flex-col gap-1">
+                  {node.status === "pending" || (node.status === "in_progress" && !node.childThreadId) ? (
+                    <Button size="sm" disabled={pending} onClick={() => onStartNode(node.id)}>
+                      Start
+                    </Button>
+                  ) : null}
+                  {node.status === "in_progress" ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={pending}
+                      onClick={() => onCompleteNode(node.id)}
+                    >
+                      Done
+                    </Button>
+                  ) : null}
+                  {node.child ? (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => navigate.toThread(node.child!.id)}
+                    >
+                      Open
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+      <form
+        className="flex gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!workerTitle.trim()) return;
+          onAddWorker(workerTitle.trim());
+          setWorkerTitle("");
+        }}
+      >
+        <Input
+          value={workerTitle}
+          onChange={(event) => setWorkerTitle(event.target.value)}
+          placeholder="Add Worker node"
+          aria-label="Add Worker node"
+          disabled={pending}
+        />
+        <Button type="submit" size="sm" disabled={pending || workerTitle.trim() === ""}>
+          Add Worker
+        </Button>
+      </form>
+    </div>
+  );
+}
+
 export function HarnessPanel({
   threadId: threadIdProp,
 }: {
@@ -581,8 +597,26 @@ export function HarnessPanel({
   const ctx = useBbContext();
   const threadId = threadIdProp ?? ctx.threadId;
   const projectId = ctx.projectId;
-  const { rpc, status, error, pending, run } = useHarness(threadId, projectId);
+  const { rpc, status, error, pending, run, refetch } = useHarness(threadId, projectId);
   const live = status?.run ? isLiveRunStatus(status.run.status) : false;
+  const manual = Boolean(status?.harness && status.harness.engine === "manual" && !status.run);
+
+  const startForm = (
+    <StartHarnessForm
+      pending={pending}
+      customHarnesses={status?.customHarnesses ?? []}
+      onRefresh={refetch}
+      onStart={(input) => {
+        void run(() =>
+          rpc.call("startRun", {
+            threadId: threadId!,
+            projectId: projectId ?? undefined,
+            ...input,
+          }),
+        );
+      }}
+    />
+  );
 
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
@@ -590,8 +624,8 @@ export function HarnessPanel({
         <p className="text-sm text-muted-foreground">
           Ordinary chats stay ordinary until you start a Harness run. Then
           isolate Explore, Plan, Worker, Critic, and Promote — one node at a
-          time. v1 runs one fixed Worker + Tester after plan approval, with
-          auditable output in <code>artifacts/</code>.
+          time. Standard Harness is the default. Milestone Pipeline is optional.
+          Auditable output lives in <code>artifacts/</code>.
         </p>
 
         {!threadId ? (
@@ -652,6 +686,78 @@ export function HarnessPanel({
                   );
                 }}
               />
+            ) : manual ? (
+              <ManualHarnessView
+                status={status}
+                pending={pending}
+                onAdvance={() => {
+                  void run(() =>
+                    rpc.call("advance", {
+                      threadId,
+                      projectId: projectId ?? undefined,
+                    }),
+                  );
+                }}
+                onRewind={() => {
+                  void run(() =>
+                    rpc.call("rewind", {
+                      threadId,
+                      projectId: projectId ?? undefined,
+                    }),
+                  );
+                }}
+                onStop={() => {
+                  void run(() =>
+                    rpc.call("stopRun", {
+                      threadId,
+                      projectId: projectId ?? undefined,
+                    }),
+                  );
+                }}
+                onStartNode={(nodeId) => {
+                  if (!status.plan) return;
+                  void run(() =>
+                    rpc.call("startNode", {
+                      planId: status.plan!.id,
+                      nodeId,
+                      threadId,
+                    }),
+                  );
+                }}
+                onCompleteNode={(nodeId) => {
+                  if (!status.plan) return;
+                  void run(() =>
+                    rpc.call("completeNode", {
+                      planId: status.plan!.id,
+                      nodeId,
+                    }),
+                  );
+                }}
+                onAddWorker={(title) => {
+                  if (!status.plan) return;
+                  const workers = status.plan.nodes.filter((node) => node.phase === "worker");
+                  const last = workers[workers.length - 1];
+                  const planNode = status.plan.nodes.find((node) => node.phase === "plan");
+                  void run(() =>
+                    rpc.call("addNode", {
+                      planId: status.plan!.id,
+                      title,
+                      phase: "worker",
+                      deps: last ? [last.id] : planNode ? [planNode.id] : [],
+                    }),
+                  );
+                }}
+                onSetRouting={(nodeId, choice) => {
+                  if (!status.plan) return;
+                  void run(() =>
+                    rpc.call("setNodeRouting", {
+                      planId: status.plan!.id,
+                      nodeId,
+                      choice,
+                    }),
+                  );
+                }}
+              />
             ) : (
               <div className="mt-4 rounded-lg border border-dashed border-border px-4 py-5">
                 <p className="text-sm font-medium">Harness is inactive</p>
@@ -659,34 +765,10 @@ export function HarnessPanel({
                   Starting requires an explicit task. No arc, banner, or role
                   child is created until you start.
                 </p>
-                <StartHarnessForm
-                  pending={pending}
-                  onStart={(input) => {
-                    void run(() =>
-                      rpc.call("startRun", {
-                        threadId,
-                        projectId: projectId ?? undefined,
-                        ...input,
-                      }),
-                    );
-                  }}
-                />
+                {startForm}
               </div>
             )}
-            {status.run && !live ? (
-              <StartHarnessForm
-                pending={pending}
-                onStart={(input) => {
-                  void run(() =>
-                    rpc.call("startRun", {
-                      threadId,
-                      projectId: projectId ?? undefined,
-                      ...input,
-                    }),
-                  );
-                }}
-              />
-            ) : null}
+            {status.run && !live ? startForm : null}
           </>
         )}
 
@@ -710,17 +792,26 @@ export function HarnessBanner({
   const projectId = ctx.projectId;
   const { status } = useHarness(threadId, projectId);
   const run = status?.run;
-  if (!run || !isLiveRunStatus(run.status)) return null;
-  const role = run.currentNode
-    ? ROLE_TITLE[run.currentNode.role as AgentRole]
-    : null;
-  const next = role ? ` · ${role}` : "";
-  return (
-    <p className="px-1 text-xs text-muted-foreground">
-      Harness · {PHASE_COPY[status.arc.phase].label}
-      {next}
-    </p>
-  );
+  if (run && isLiveRunStatus(run.status)) {
+    const role = run.currentNode
+      ? ROLE_TITLE[run.currentNode.role as AgentRole]
+      : null;
+    const next = role ? ` · ${role}` : "";
+    return (
+      <p className="px-1 text-xs text-muted-foreground">
+        Harness · {PHASE_COPY[status.arc.phase].label}
+        {next}
+      </p>
+    );
+  }
+  if (status?.harness?.engine === "manual") {
+    return (
+      <p className="px-1 text-xs text-muted-foreground">
+        Harness · {PHASE_COPY[status.arc.phase].label}
+      </p>
+    );
+  }
+  return null;
 }
 
 export function HarnessHeaderAction({

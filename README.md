@@ -4,16 +4,22 @@ A BB plugin for [Scott Fryxell's harness philosophy](https://scott-fryxell.githu
 
 **Explore → Plan → Worker → Critic → Promote.** Isolated roles. Explicit DAG. One node at a time. Auditable output in `artifacts/`.
 
-Worker, Critic, and Promote spawn a **child thread**. Explore and Plan stay on the parent. Pick a real provider/model per role in plugin settings, or override it on a DAG node.
+**Standard Harness** is the built-in default. Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn a visible child. Critic may rewind Worker. Promote communicates. It is not a template.
+
+**Milestone Pipeline** is an optional specialized Harness (Scout, optional Specialist, Planner approval, one Worker + Tester, Reviewer, one correction, Promote). It is never auto-selected.
+
+**Create Harness** clones Standard Harness into a saved custom definition (name, description, and per-phase instructions). Built-ins are immutable. Starting snapshots the chosen definition into that thread's plan.
+
+Ordinary chats stay inactive until you explicitly Start Harness.
 
 ## Surfaces
 
-- **Sidebar → Harness** — per-thread arc, role routing band, DAG checklist, child-thread status
+- **Sidebar → Harness** — Start form, Standard/custom DAG, or Milestone run
 - **Thread panel → Harness** — the same UI on the conversation
 - **Settings → Role routing** — host provider/model picker per role
-- **Composer banner** — current phase and next node
-- **`bb harness`** — status, advance, init, plan create/list/show/next/start/complete
-- **Agent tools** — `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`
+- **Composer banner** — current phase when a Harness is active
+- **`bb harness`** — status, start (`--harness <id>` or `--milestone`), advance, init, plan commands
+- **Agent tools** — `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`, plus `harness_submit_result` on Milestone children
 - **Skill** — `skills/harness-arc`
 
 ## Install
@@ -32,6 +38,9 @@ From a thread:
 
 ```
 bb harness status
+bb harness start --task "Ship the feature"
+bb harness start --task "Ship the feature" --harness milestone-pipeline
+bb harness start --task "Ship the feature" --milestone
 bb harness plan create "Ship the feature"
 bb harness plan start <plan-id> worker
 bb harness advance
@@ -40,7 +49,9 @@ bb harness init
 
 `init` writes `HARNESS.md`, `artifacts/`, and `plans/` into the thread's workspace. Existing files are left alone.
 
-Starting a worker/critic/promote node spawns a visible child thread with that role's provider/model (or the parent thread's, if the slot is unset). Click **Done** on the parent Harness panel after reviewing — idle does not auto-complete the node.
+Starting Standard/custom writes an explicit arc and a uniquely-id'd seeded plan. No child is spawned until you Start a Worker, Critic, or Promote node. Click **Done** on the parent after review.
+
+Starting Milestone Pipeline uses the durable run engine and spawns the first ready role child immediately.
 
 ## Remove
 
@@ -54,10 +65,11 @@ Nothing is written into BB core. `bb harness init` only adds `artifacts/`, `plan
 
 ## Settings
 
-Plugin settings → **Role routing**: one picker per slot (Explore, Plan, Worker first, Worker later, Critic, Promote). Clear a slot to inherit the parent thread.
+Plugin settings → **Role routing**: one picker per slot (Explore/Scout, Plan/Planner, Worker first, Worker later, Critic/Reviewer, Promote). Clear a slot to inherit the parent thread.
 
 Per-node overrides live on the DAG row in the Harness panel.
 
 ## Not in this version
 
 Headless product-driver (poster-driver / `npm run make:animation`) is deferred.
+Custom Harnesses keep the five arcs and one sequential node per phase; they do not change the Milestone engine.
