@@ -17,7 +17,7 @@ Ordinary chats stay ordinary until the operator explicitly starts a Harness.
 4. **Critic** — simplify and push back. Complete with APPROVE, REWORK, or BLOCK. Spawns a child thread.
 5. **Promote** — the job is unfinished until you communicate it. Spawns a child thread.
 
-Custom Harnesses clone this five-arc shape. Name, description, per-phase instructions, parent/child execution, skill names, artifact policy, promote mode, and max corrections can change. Starting snapshots the resolved definition into the plan so later edits do not rewrite in-flight work.
+Custom Harnesses clone this five-arc shape. Name, description, per-phase instructions, parent/child execution, artifact policy, promote mode (`always` or `off`), and max corrections can change. Starting snapshots the resolved definition into the plan so later edits do not rewrite in-flight work. This plugin injects only `harness-arc`; it cannot attach arbitrary BB skills.
 
 Milestone Pipeline is removed. Do not start `--milestone` or `milestone-pipeline`.
 

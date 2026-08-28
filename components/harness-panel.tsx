@@ -484,6 +484,7 @@ export function HarnessPanel({
                       planId: status.plan!.id,
                       nodeId,
                       threadId,
+                      projectId: projectId ?? undefined,
                     }),
                   );
                 }}
@@ -493,6 +494,8 @@ export function HarnessPanel({
                     rpc.call("completeNode", {
                       planId: status.plan!.id,
                       nodeId,
+                      threadId,
+                      projectId: projectId ?? undefined,
                       ...extra,
                     }),
                   );
@@ -503,6 +506,8 @@ export function HarnessPanel({
                     rpc.call("reopenNode", {
                       planId: status.plan!.id,
                       nodeId,
+                      threadId,
+                      projectId: projectId ?? undefined,
                     }),
                   );
                 }}
@@ -517,6 +522,8 @@ export function HarnessPanel({
                       title,
                       phase: "worker",
                       deps: last ? [last.id] : planNode ? [planNode.id] : [],
+                      threadId,
+                      projectId: projectId ?? undefined,
                     }),
                   );
                 }}
@@ -527,12 +534,20 @@ export function HarnessPanel({
                       planId: status.plan!.id,
                       nodeId,
                       choice,
+                      threadId,
+                      projectId: projectId ?? undefined,
                     }),
                   );
                 }}
                 onResetBlock={() => {
                   if (!status.plan) return;
-                  void run(() => rpc.call("resetCriticBlock", { planId: status.plan!.id }));
+                  void run(() =>
+                    rpc.call("resetCriticBlock", {
+                      planId: status.plan!.id,
+                      threadId,
+                      projectId: projectId ?? undefined,
+                    }),
+                  );
                 }}
               />
             ) : (

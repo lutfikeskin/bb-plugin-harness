@@ -23,7 +23,7 @@ import {
   seedNodeId,
 } from "../lib/harness";
 import { DEFAULT_PHASE_SPECS } from "../lib/harness";
-import { canRework, parseTokenUsageEvent } from "../lib/outcomes";
+import { canRework, parseArtifactPaths, parsePromoteMode, parseTokenUsageEvent } from "../lib/outcomes";
 
 describe("harness definitions", () => {
   it("defaults start selection to Standard Harness", () => {
@@ -106,7 +106,7 @@ describe("harness definitions", () => {
     expect(created.kind).toBe("custom");
     expect(created.engine).toBe("manual");
     expect(created.phases.critic.detail).toBe("Be meaner.");
-    expect(created.phases.critic.skills).toEqual(["review"]);
+    expect(created.phases.critic.skills).toEqual([]);
     expect(created.maxCorrections).toBe(2);
     const frozen = snapshotHarness(created);
     const patched = applyHarnessPatch(
@@ -208,5 +208,34 @@ describe("harness definitions", () => {
     expect(parseTokenUsageEvent({ type: "thread/tokenUsage/updated" })).toBeNull();
     expect(canRework(1, 1)).toBe(false);
     expect(canRework(1, null)).toBe(true);
+  });
+
+  it("maps retired ask promoteMode to always and ignores phase skill fields", () => {
+    expect(parsePromoteMode("ask")).toBe("always");
+    expect(parsePromoteMode("off")).toBe("off");
+    const parsed = parseHarnessDefinition({
+      ...standardHarnessDefinition(),
+      id: "c-old-skills-1111",
+      kind: "custom",
+      promoteMode: "ask",
+      phases: {
+        ...standardHarnessDefinition().phases,
+        worker: {
+          ...standardHarnessDefinition().phases.worker,
+          skills: ["review", "../escape"],
+        },
+      },
+    });
+    expect(parsed?.promoteMode).toBe("always");
+    expect(parsed?.phases.worker.skills).toEqual([]);
+  });
+
+  it("rejects absolute and traversal artifact refs", () => {
+    expect(parseArtifactPaths(["artifacts/harness/p1/out.md"])).toEqual([
+      "artifacts/harness/p1/out.md",
+    ]);
+    expect(parseArtifactPaths(["/etc/passwd"])).toBeNull();
+    expect(parseArtifactPaths(["artifacts/../secret"])).toBeNull();
+    expect(parseArtifactPaths(["plans/notes.md"])).toBeNull();
   });
 });

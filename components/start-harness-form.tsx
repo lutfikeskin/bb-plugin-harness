@@ -242,7 +242,7 @@ export function StartHarnessForm({
           {showAdvanced ? (
             <div className="space-y-2">
               {PHASES.map((phase) => (
-                <div key={`${phase}-adv`} className="grid grid-cols-2 gap-2">
+                <div key={`${phase}-adv`}>
                   <label className="text-[11px] text-muted-foreground">
                     {PHASE_COPY[phase].label} execution
                     <select
@@ -256,22 +256,6 @@ export function StartHarnessForm({
                       <option value="parent">parent</option>
                       <option value="child">child</option>
                     </select>
-                  </label>
-                  <label className="text-[11px] text-muted-foreground">
-                    Skills
-                    <Input
-                      value={draftPhases[phase].skills.join(", ")}
-                      onChange={(event) =>
-                        setPhase(phase, {
-                          skills: event.target.value
-                            .split(",")
-                            .map((item) => item.trim())
-                            .filter(Boolean),
-                        })
-                      }
-                      aria-label={`${PHASE_COPY[phase].label} skills`}
-                      placeholder="skill names"
-                    />
                   </label>
                 </div>
               ))}

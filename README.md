@@ -6,7 +6,7 @@ A BB plugin for [Scott Fryxell's harness idea](https://scott-fryxell.github.io/b
 
 **Standard Harness** is the built-in, immutable default. Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn a visible child. Critic completes with **APPROVE**, **REWORK**, or **BLOCK**. Promote communicates. It is not a template.
 
-**Create Harness** clones Standard into a saved custom definition: name, description, per-phase instructions, parent/child execution, skill names, artifact policy, promote mode, and a correction ceiling. Built-ins are immutable. Starting snapshots the resolved definition into that thread's plan.
+**Create Harness** clones Standard into a saved custom definition: name, description, per-phase instructions, parent/child execution, artifact policy, promote mode (`always` or `off`), and a correction ceiling. Built-ins are immutable. Starting snapshots the resolved definition into that thread's plan. This plugin injects only its own `harness-arc` skill; arbitrary BB skill names are not a custom-Harness control.
 
 Ordinary chats stay inactive until you explicitly Start Harness.
 
@@ -74,4 +74,4 @@ Per-node overrides live on the DAG row in the Harness panel.
 Headless product-driver (poster-driver / `npm run make:animation`) is deferred.
 Custom Harnesses keep the five arcs. They do not become a generic DAG builder, hook runner, or automatic model router.
 Child token totals come from BB `thread/tokenUsage/updated` when present; missing usage stays null and no cost is invented.
-Skill names are BB references recorded on the snapshot. This plugin injects only its own `harness-arc` skill when listed; unresolved names warn and do not rewrite the definition.
+Arbitrary external skill injection is not supported. Parent-execution nodes receive frozen custom title and detail plus `harness-arc`.

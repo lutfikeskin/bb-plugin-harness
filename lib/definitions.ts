@@ -10,9 +10,8 @@ import {
 } from "./harness";
 import {
   isArtifactPolicy,
-  isPromoteMode,
   parseMaxCorrections,
-  parseSkillNames,
+  parsePromoteMode,
   type ArtifactPolicy,
   type PromoteMode,
 } from "./outcomes";
@@ -125,9 +124,7 @@ function parsePhaseSpec(phase: Phase, value: unknown): PhaseSpec | null {
     typeof item.execution === "string" && isExecutionMode(item.execution)
       ? item.execution
       : DEFAULT_EXECUTION[phase];
-  const skills = parseSkillNames(item.skills);
-  if (!skills) return null;
-  return { title, detail, execution, skills };
+  return { title, detail, execution, skills: [] };
 }
 
 function parsePhaseSpecs(value: unknown): Record<Phase, PhaseSpec> | null {
@@ -174,10 +171,7 @@ export function parseHarnessDefinition(value: unknown): HarnessDefinition | null
     typeof record.artifactPolicy === "string" && isArtifactPolicy(record.artifactPolicy)
       ? record.artifactPolicy
       : "advisory";
-  const promoteMode =
-    typeof record.promoteMode === "string" && isPromoteMode(record.promoteMode)
-      ? record.promoteMode
-      : "always";
+  const promoteMode = parsePromoteMode(record.promoteMode);
   const maxCorrections =
     record.maxCorrections === undefined ? null : parseMaxCorrections(record.maxCorrections);
   if (maxCorrections === undefined) return null;
@@ -270,9 +264,6 @@ export function validateHarnessDraft(draft: HarnessDraft): string | null {
       if (spec.execution !== undefined && !isExecutionMode(spec.execution)) {
         return `${phase} execution must be parent or child.`;
       }
-      if (spec.skills !== undefined && parseSkillNames(spec.skills) == null) {
-        return `${phase} skills are invalid.`;
-      }
     }
   }
   return null;
@@ -305,12 +296,11 @@ function mergePhaseSpecs(
   for (const phase of PHASES) {
     const spec = patch[phase];
     if (!spec) continue;
-    const skills = spec.skills ? parseSkillNames(spec.skills) : phases[phase].skills;
     phases[phase] = {
       title: spec.title?.trim() || phases[phase].title,
       detail: spec.detail?.trim() || phases[phase].detail,
       execution: spec.execution ?? phases[phase].execution,
-      skills: skills ?? phases[phase].skills,
+      skills: [],
     };
   }
   return phases;
@@ -335,7 +325,9 @@ export function cloneStandardHarness(
     schemaVersion: HARNESS_SCHEMA_VERSION,
     phases: mergePhaseSpecs(standard.phases, draft.phases),
     artifactPolicy: draft.artifactPolicy ?? standard.artifactPolicy,
-    promoteMode: draft.promoteMode ?? standard.promoteMode,
+    promoteMode: draft.promoteMode !== undefined
+      ? parsePromoteMode(draft.promoteMode)
+      : standard.promoteMode,
     maxCorrections:
       draft.maxCorrections !== undefined ? draft.maxCorrections : standard.maxCorrections,
     createdAt: now,
@@ -361,7 +353,9 @@ export function applyHarnessPatch(
       : current.description,
     phases: mergePhaseSpecs(current.phases, draft.phases),
     artifactPolicy: draft.artifactPolicy ?? current.artifactPolicy,
-    promoteMode: draft.promoteMode ?? current.promoteMode,
+    promoteMode: draft.promoteMode !== undefined
+      ? parsePromoteMode(draft.promoteMode)
+      : current.promoteMode,
     maxCorrections:
       draft.maxCorrections !== undefined ? draft.maxCorrections : current.maxCorrections,
     schemaVersion: HARNESS_SCHEMA_VERSION,

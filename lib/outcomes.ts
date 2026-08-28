@@ -4,7 +4,7 @@ export type CriticVerdict = (typeof CRITIC_VERDICTS)[number];
 export const ARTIFACT_POLICIES = ["off", "advisory", "required"] as const;
 export type ArtifactPolicy = (typeof ARTIFACT_POLICIES)[number];
 
-export const PROMOTE_MODES = ["always", "ask", "off"] as const;
+export const PROMOTE_MODES = ["always", "off"] as const;
 export type PromoteMode = (typeof PROMOTE_MODES)[number];
 
 export const PLUGIN_SKILL_NAME = "harness-arc";
@@ -45,20 +45,24 @@ export function isPromoteMode(value: string): value is PromoteMode {
   return (PROMOTE_MODES as readonly string[]).includes(value);
 }
 
-export function parseSkillNames(value: unknown): string[] | null {
-  if (value === undefined) return [];
-  if (!Array.isArray(value)) return null;
-  if (value.length > MAX_PHASE_SKILLS) return null;
-  const out: string[] = [];
-  for (const item of value) {
-    if (typeof item !== "string") return null;
-    const name = item.trim();
-    if (name.length === 0) continue;
-    if (name.length > MAX_SKILL_NAME_LENGTH) return null;
-    if (out.includes(name)) continue;
-    out.push(name);
-  }
-  return out;
+/** `ask` is a retired alias of `always`. Unknown values are not promote modes. */
+export function parsePromoteMode(value: unknown): PromoteMode {
+  if (value === "off") return "off";
+  return "always";
+}
+
+export function isSafeArtifactRef(path: string): boolean {
+  const normalized = path.trim().replace(/\\/g, "/");
+  if (!normalized || normalized.length > MAX_ARTIFACT_PATH_LENGTH) return false;
+  if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) return false;
+  if (normalized.includes("://")) return false;
+  const parts = normalized.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) return false;
+  return parts[0] === "artifacts";
+}
+
+export function parseSkillNames(_value: unknown): string[] {
+  return [];
 }
 
 export function parseMaxCorrections(value: unknown): number | null | undefined {
@@ -76,9 +80,10 @@ export function parseArtifactPaths(value: unknown): string[] | null {
   const out: string[] = [];
   for (const item of value) {
     if (typeof item !== "string") return null;
-    const path = item.trim();
+    const path = item.trim().replace(/\\/g, "/");
     if (path.length === 0) continue;
-    if (path.length > MAX_ARTIFACT_PATH_LENGTH) return null;
+    if (!isSafeArtifactRef(path)) return null;
+    if (out.includes(path)) continue;
     out.push(path);
   }
   return out;
@@ -148,14 +153,4 @@ export function durationMs(startedAt: number | null, endedAt: number | null): nu
 export function canRework(correctionCount: number, maxCorrections: number | null): boolean {
   if (maxCorrections == null) return true;
   return correctionCount < maxCorrections;
-}
-
-export function unresolvedSkillWarning(names: readonly string[], known: ReadonlySet<string>): string | null {
-  const missing = names.filter((name) => !known.has(name));
-  if (missing.length === 0) return null;
-  return `Unresolved skill references (shown as warnings; instructions still apply): ${missing.join(", ")}`;
-}
-
-export function pluginSkillsFor(names: readonly string[]): string[] {
-  return names.filter((name) => name === PLUGIN_SKILL_NAME);
 }

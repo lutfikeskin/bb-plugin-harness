@@ -86,6 +86,7 @@ function activeStatus(): HarnessStatusDto {
         child: null,
         result: null,
         attempt: null,
+        attempts: [],
       })),
     },
   };

@@ -51,6 +51,7 @@ import {
   removedHarnessError,
   resolveHarnessId,
   snapshotHarness,
+  seedNodesFromDefinition,
   standardHarnessDefinition,
   toHarnessRef,
   type HarnessDefinition,
@@ -70,9 +71,8 @@ import {
   canRework,
   durationMs,
   emptyTokenCounters,
+  parseArtifactPaths,
   parseTokenUsageEvent,
-  pluginSkillsFor,
-  unresolvedSkillWarning,
   type CriticVerdict,
   type TokenCounters,
 } from "./lib/outcomes";
@@ -159,6 +159,7 @@ const planNodeSchema = z.object({
   child: childThreadSchema.nullable(),
   result: nodeResultSchema.nullable(),
   attempt: nodeAttemptSchema.nullable(),
+  attempts: z.array(nodeAttemptSchema),
 });
 
 const phaseSpecSchema = z.object({
@@ -207,7 +208,10 @@ const harnessDraftSchema = z.object({
     })
     .optional(),
   artifactPolicy: z.enum(ARTIFACT_POLICIES).optional(),
-  promoteMode: z.enum(PROMOTE_MODES).optional(),
+  promoteMode: z.preprocess(
+    (value) => (value === "ask" ? "always" : value),
+    z.enum(PROMOTE_MODES).optional(),
+  ),
   maxCorrections: z.number().int().min(0).max(MAX_CORRECTIONS).nullable().optional(),
 });
 
@@ -268,9 +272,15 @@ const startRunInputSchema = z.object({
 const completeNodeInputSchema = z.object({
   planId: z.string(),
   nodeId: z.string(),
+  projectId: z.string().optional(),
+  threadId: z.string().optional(),
   verdict: criticVerdictSchema.optional(),
   summary: z.string().trim().max(MAX_RESULT_SUMMARY).optional(),
   artifactPaths: z.array(z.string().trim().min(1).max(MAX_ARTIFACT_PATH_LENGTH)).max(MAX_ARTIFACT_PATHS).optional(),
+});
+const planAccessSchema = z.object({
+  projectId: z.string().optional(),
+  threadId: z.string().optional(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -312,7 +322,7 @@ export const rpcContract = defineRpcContract({
     output: z.object({ plans: z.array(planMetaSchema) }),
   },
   getPlan: {
-    input: z.object({ id: z.string() }),
+    input: z.object({ id: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema.nullable() }),
   },
   createPlan: {
@@ -331,15 +341,14 @@ export const rpcContract = defineRpcContract({
       detail: z.string().max(2000).optional(),
       phase: phaseSchema.optional(),
       deps: z.array(z.string()).optional(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   startNode: {
     input: z.object({
       planId: z.string(),
       nodeId: z.string(),
-      threadId: z.string().optional(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   getRouting: {
@@ -358,7 +367,7 @@ export const rpcContract = defineRpcContract({
       planId: z.string(),
       nodeId: z.string(),
       choice: executionChoiceSchema.nullable(),
-    }),
+    }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   suggestChoice: {
@@ -370,15 +379,15 @@ export const rpcContract = defineRpcContract({
     output: z.object({ plan: planFullSchema }),
   },
   skipNode: {
-    input: z.object({ planId: z.string(), nodeId: z.string() }),
+    input: z.object({ planId: z.string(), nodeId: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   reopenNode: {
-    input: z.object({ planId: z.string(), nodeId: z.string() }),
+    input: z.object({ planId: z.string(), nodeId: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   resetCriticBlock: {
-    input: z.object({ planId: z.string() }),
+    input: z.object({ planId: z.string() }).merge(planAccessSchema),
     output: z.object({ plan: planFullSchema }),
   },
   initWorkspace: {
@@ -503,6 +512,12 @@ function parseSkillsJson(raw: string | null): string[] {
   } catch {
     return [];
   }
+}
+
+function readThreadModel(thread: unknown): string | null {
+  if (!thread || typeof thread !== "object") return null;
+  const model = (thread as { model?: unknown }).model;
+  return typeof model === "string" && model.trim() ? model : null;
 }
 
 function toNode(row: NodeRow): PlanNode {
@@ -725,6 +740,10 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const selectArc = db.prepare("SELECT * FROM arcs WHERE thread_id = ?");
+  const insertArc = db.prepare(
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id)`,
+  );
   const upsertArc = db.prepare(
     `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id)
      VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id)
@@ -789,18 +808,12 @@ export default async function plugin(bb: BbPluginApi) {
     `INSERT INTO plan_node_results (id, plan_id, node_id, verdict, summary, artifact_paths, actor, source, created_at)
      VALUES (@id, @plan_id, @node_id, @verdict, @summary, @artifact_paths, @actor, @source, @created_at)`,
   );
-  const selectLatestResult = db.prepare(
-    `SELECT * FROM plan_node_results WHERE plan_id = ? AND node_id = ? ORDER BY created_at DESC LIMIT 1`,
-  );
   const selectResultsForPlan = db.prepare(
     `SELECT * FROM plan_node_results WHERE plan_id = ? ORDER BY created_at ASC`,
   );
   const insertArtifact = db.prepare(
     `INSERT INTO harness_artifacts (id, plan_id, node_id, path, created_at)
      VALUES (@id, @plan_id, @node_id, @path, @created_at)`,
-  );
-  const selectArtifacts = db.prepare(
-    "SELECT * FROM harness_artifacts WHERE plan_id = ? ORDER BY created_at ASC",
   );
   const insertAttempt = db.prepare(
     `INSERT INTO plan_node_attempts (
@@ -824,9 +837,6 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const selectOpenAttemptByChild = db.prepare(
     "SELECT * FROM plan_node_attempts WHERE child_thread_id = ? AND ended_at IS NULL ORDER BY created_at DESC LIMIT 1",
-  );
-  const selectLatestAttempt = db.prepare(
-    "SELECT * FROM plan_node_attempts WHERE plan_id = ? AND node_id = ? ORDER BY created_at DESC LIMIT 1",
   );
   const selectHistoricalLiveRun = db.prepare(
     `SELECT * FROM harness_runs
@@ -973,20 +983,15 @@ export default async function plugin(bb: BbPluginApi) {
     return { durationMs: duration, tokens };
   }
 
-  function skillWarningsFor(definition: HarnessDefinition | null, known: Set<string>): string[] {
-    if (!definition) return [];
-    const names = PHASES.flatMap((phase) => definition.phases[phase].skills);
-    const warning = unresolvedSkillWarning(names, known);
-    return warning ? [warning] : [];
-  }
-
   async function enrichNodes(
     planId: string,
     nodes: PlanNode[],
   ): Promise<z.infer<typeof planNodeSchema>[]> {
-    const latestAttempts = new Map<string, AttemptRow>();
+    const attemptsByNode = new Map<string, AttemptRow[]>();
     for (const item of selectAttemptsForPlan.all(planId) as AttemptRow[]) {
-      latestAttempts.set(item.node_id, item);
+      const list = attemptsByNode.get(item.node_id) ?? [];
+      list.push(item);
+      attemptsByNode.set(item.node_id, list);
     }
     const latestResults = new Map<string, ResultRow>();
     for (const item of selectResultsForPlan.all(planId) as ResultRow[]) {
@@ -1011,7 +1016,8 @@ export default async function plugin(bb: BbPluginApi) {
           skills: node.skills ?? [],
           child: null as z.infer<typeof childThreadSchema> | null,
           result: resultDto(latestResults.get(node.id)),
-          attempt: attemptDto(latestAttempts.get(node.id)),
+          attempt: attemptDto((attemptsByNode.get(node.id) ?? []).at(-1)),
+          attempts: (attemptsByNode.get(node.id) ?? []).map((row) => attemptDto(row)!),
         };
         if (!node.childThreadId) return base;
         try {
@@ -1048,7 +1054,7 @@ export default async function plugin(bb: BbPluginApi) {
       nodes: await enrichNodes(row.id, nodes),
       harnessSnapshot: snapshot,
       totals: planTotals(row.id),
-      skillWarnings: skillWarningsFor(snapshot, new Set([PLUGIN_SKILL_NAME])),
+      skillWarnings: [] as string[],
     };
   }
 
@@ -1056,6 +1062,40 @@ export default async function plugin(bb: BbPluginApi) {
     const row = selectPlan.get(id) as PlanRow | undefined;
     if (!row) throw new Error(`No plan with id ${id}`);
     return row;
+  }
+
+  type PlanAccess = {
+    projectId?: string | null;
+    threadId?: string | null;
+  };
+
+  function planCallerRole(plan: PlanRow, access: PlanAccess): "owner" | "child" | "project" | "denied" {
+    if (access.projectId && access.projectId !== plan.project_id) return "denied";
+    if (access.threadId) {
+      if (plan.thread_id && access.threadId === plan.thread_id) return "owner";
+      const child = selectNodeByChild.get(access.threadId) as NodeRow | undefined;
+      if (child && child.plan_id === plan.id) return "child";
+      return "denied";
+    }
+    if (access.projectId === plan.project_id) return "project";
+    return "denied";
+  }
+
+  function requirePlanAccess(planId: string, access: PlanAccess, mode: "read" | "mutate"): PlanRow {
+    const plan = requirePlan(planId);
+    const role = planCallerRole(plan, access);
+    if (role === "denied") {
+      throw new Error("This plan does not belong to this project or thread.");
+    }
+    if (mode === "mutate" && role !== "owner") {
+      if (role === "child") {
+        throw new Error(
+          "Child threads cannot complete, skip, or rework Harness nodes. The parent operator owns those actions.",
+        );
+      }
+      throw new Error("Plan mutations require the owning thread.");
+    }
+    return plan;
   }
 
   function planForThread(projectId: string, threadId: string): PlanRow | null {
@@ -1198,16 +1238,14 @@ export default async function plugin(bb: BbPluginApi) {
 
   function nodePrompt(node: PlanNode, phase: Phase): string {
     const copy = PHASE_COPY[phase];
-    const skills = (node.skills ?? []).join(", ");
     return [
       `You are the ${copy.label} for one harness DAG node.`,
       copy.summary,
       "Work this node only. Do not plan, implement, and critique in the same pass.",
       "Keep auditable outputs in artifacts/.",
       phase === "critic"
-        ? "When finished, complete this node with verdict APPROVE, REWORK, or BLOCK and a short summary."
-        : "When you finish, stop. The parent operator marks the node Done after review.",
-      skills ? `Referenced skills (BB names; unresolved names are warnings, not silent rewrites): ${skills}` : null,
+        ? "When finished, stop. The parent operator records APPROVE, REWORK, or BLOCK and a short summary. Do not complete or rework this node yourself."
+        : "When you finish, stop. The parent operator marks the node Done after review. Do not complete this node yourself.",
       "",
       `Node id: ${node.id}`,
       `Title: ${node.title}`,
@@ -1234,6 +1272,30 @@ export default async function plugin(bb: BbPluginApi) {
       return null;
     }
     return null;
+  }
+
+  async function stopChildThread(threadId: string, label: string): Promise<void> {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+      await closeAttemptForChild(threadId);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Cannot ${label}: failed to stop child ${threadId}. ${reason}`);
+    }
+  }
+
+  async function stopLiveChildren(
+    nodes: PlanNode[],
+    label: string,
+    predicate: (node: PlanNode) => boolean = () => true,
+  ): Promise<PlanNode[]> {
+    const live = nodes.filter(
+      (node) => node.status === "in_progress" && node.childThreadId && predicate(node),
+    );
+    for (const node of live) {
+      await stopChildThread(node.childThreadId!, label);
+    }
+    return live;
   }
 
   async function closeAttemptForChild(childThreadId: string): Promise<void> {
@@ -1434,6 +1496,8 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : {}),
       });
+      const parentModel = readThreadModel(parent);
+      const childModel = readThreadModel(child);
       updateNodeChild.run(child.id, node.id, planId);
       const now = Date.now();
       insertAttempt.run({
@@ -1441,8 +1505,8 @@ export default async function plugin(bb: BbPluginApi) {
         plan_id: planId,
         node_id: node.id,
         child_thread_id: child.id,
-        provider_id: choice?.providerId ?? child.providerId ?? null,
-        model: choice?.model ?? null,
+        provider_id: choice?.providerId ?? parent.providerId ?? child.providerId ?? null,
+        model: choice?.model ?? parentModel ?? childModel,
         started_at: now,
         ended_at: null,
         duration_ms: null,
@@ -1489,42 +1553,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   function insertSeedNodes(planId: string, definition?: HarnessDefinition): void {
     const source = definition ?? standardHarnessDefinition();
-    for (const [index, node] of seedNodesWithStatus(planId, source).entries()) {
+    for (const [index, node] of seedNodesFromDefinition(planId, source).entries()) {
       insertNode.run({
         id: node.id,
         plan_id: planId,
         title: node.title,
         detail: node.detail,
         phase: node.phase,
-        status: node.status,
+        status: node.status ?? "pending",
         deps: JSON.stringify(node.deps),
         sort_order: index,
         execution: node.execution,
-        skills: JSON.stringify(node.skills ?? []),
+        skills: JSON.stringify([]),
       });
     }
-  }
-
-  function seedNodesWithStatus(planId: string, definition: HarnessDefinition) {
-    return definition.phases
-      ? PHASES.map((phase, index) => {
-          const spec = definition.phases[phase];
-          const previous = index > 0 ? PHASES[index - 1]! : null;
-          return {
-            id: `${planId}-${phase}`,
-            title: spec.title,
-            detail: spec.detail,
-            phase,
-            execution: spec.execution,
-            skills: spec.skills,
-            deps: previous ? [`${planId}-${previous}`] : [],
-            status:
-              phase === "promote" && definition.promoteMode === "off"
-                ? ("skipped" as const)
-                : ("pending" as const),
-          };
-        })
-      : [];
   }
 
   function persistPlanSnapshot(planId: string, definition: HarnessDefinition): void {
@@ -1568,7 +1610,7 @@ export default async function plugin(bb: BbPluginApi) {
     const spec = snapshot?.phases[phase];
     const detail = args.detail ?? spec?.detail ?? "";
     const execution = spec?.execution;
-    const skills = spec?.skills ?? [];
+    const skills: string[] = [];
     assertNewNodeDeps(nodes, {
       id,
       title: args.title,
@@ -1594,22 +1636,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function stopInProgressCriticChildren(planId: string): Promise<PlanNode[]> {
-    const critics = nodesOf(planId).filter(
-      (candidate) => candidate.phase === "critic" && candidate.status === "in_progress",
-    );
-    for (const critic of critics) {
-      if (!critic.childThreadId) continue;
-      try {
-        await bb.sdk.threads.stop({ threadId: critic.childThreadId });
-        await closeAttemptForChild(critic.childThreadId);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        throw new Error(
-          `Cannot reopen Worker: failed to stop Critic child ${critic.childThreadId}. ${reason}`,
-        );
-      }
-    }
-    return critics;
+    return stopLiveChildren(nodesOf(planId), "reopen Worker", (node) => node.phase === "critic");
   }
 
   async function reopenPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
@@ -1621,13 +1648,20 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`Node ${node.id} must be done before it can be reopened.`);
     }
     const critics = await stopInProgressCriticChildren(planId);
-    resetPlanNode.run("pending", node.id, planId);
-    for (const critic of critics) {
-      updateNodeStatus.run("pending", critic.id, planId);
-    }
-    touchPlan.run(Date.now(), planId);
-    publish();
+    persistWorkerReopen(planId, node.id, critics);
     return lookupPlanNode(planId, node.id);
+  }
+
+  function persistWorkerReopen(planId: string, workerId: string, critics: PlanNode[]): void {
+    const mutate = db.transaction(() => {
+      resetPlanNode.run("pending", workerId, planId);
+      for (const critic of critics) {
+        updateNodeStatus.run("pending", critic.id, planId);
+      }
+      touchPlan.run(Date.now(), planId);
+    });
+    mutate();
+    publish();
   }
 
   async function reopenLastWorker(planId: string): Promise<void> {
@@ -1639,7 +1673,20 @@ export default async function plugin(bb: BbPluginApi) {
     await reopenPlanNode(planId, last.id);
   }
 
-  async function completePlanNode(input: z.infer<typeof completeNodeInputSchema>): Promise<PlanNode> {
+  function requireArtifactPaths(raw: string[] | undefined): string[] {
+    const parsed = parseArtifactPaths(raw);
+    if (!parsed) {
+      throw new Error(
+        "Artifact refs must be relative paths under artifacts/ with no absolute or parent-directory segments.",
+      );
+    }
+    return parsed;
+  }
+
+  async function completePlanNode(
+    input: z.infer<typeof completeNodeInputSchema>,
+    attribution: { actor: string; source: string },
+  ): Promise<PlanNode> {
     const plan = requirePlan(input.planId);
     const node = lookupPlanNode(input.planId, input.nodeId);
     if (node.status !== "in_progress") {
@@ -1650,7 +1697,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const snapshot = snapshotOf(plan);
     const maxCorrections = snapshot?.maxCorrections ?? null;
-    const artifactPaths = input.artifactPaths ?? [];
+    const artifactPaths = requireArtifactPaths(input.artifactPaths);
     const summary = input.summary?.trim() || null;
 
     if (node.phase === "critic") {
@@ -1667,69 +1714,110 @@ export default async function plugin(bb: BbPluginApi) {
             `Correction limit reached (${correctionCountOf(plan)}/${maxCorrections}).`,
           );
         }
+        const critics = await stopInProgressCriticChildren(input.planId);
+        const workers = nodesOf(input.planId)
+          .filter((item) => item.phase === "worker" && item.status === "done")
+          .sort((a, b) => a.sortOrder - b.sortOrder);
+        const lastWorker = workers[workers.length - 1];
+        const commit = db.transaction(() => {
+          recordOutcome({
+            planId: input.planId,
+            nodeId: node.id,
+            verdict,
+            summary,
+            artifactPaths,
+            actor: attribution.actor,
+            source: attribution.source,
+          });
+          if (lastWorker) resetPlanNode.run("pending", lastWorker.id, input.planId);
+          for (const critic of critics) {
+            updateNodeStatus.run("pending", critic.id, input.planId);
+          }
+          const latest = requirePlan(input.planId);
+          updatePlanFlags.run(correctionCountOf(latest) + 1, latest.critic_blocked, Date.now(), input.planId);
+        });
+        commit();
+        if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
+        publish();
+        return lookupPlanNode(input.planId, node.id);
+      }
+      if (node.childThreadId) {
+        await stopChildThread(node.childThreadId, "complete Critic");
+      }
+      const commit = db.transaction(() => {
         recordOutcome({
           planId: input.planId,
           nodeId: node.id,
           verdict,
           summary,
           artifactPaths,
-          actor: "critic",
-          source: "completeNode",
+          actor: attribution.actor,
+          source: attribution.source,
         });
-        await reopenLastWorker(input.planId);
-        const latest = requirePlan(input.planId);
-        updatePlanFlags.run(correctionCountOf(latest) + 1, latest.critic_blocked, Date.now(), input.planId);
-        if (node.childThreadId) await closeAttemptForChild(node.childThreadId);
-        if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
-        publish();
-        return lookupPlanNode(input.planId, node.id);
-      }
-      recordOutcome({
-        planId: input.planId,
-        nodeId: node.id,
-        verdict,
-        summary,
-        artifactPaths,
-        actor: "critic",
-        source: "completeNode",
+        updateNodeStatus.run("done", node.id, input.planId);
+        const blocked = verdict === "BLOCK" ? 1 : 0;
+        updatePlanFlags.run(correctionCountOf(plan), blocked, Date.now(), input.planId);
       });
-      updateNodeStatus.run("done", node.id, input.planId);
-      if (node.childThreadId) await closeAttemptForChild(node.childThreadId);
-      const blocked = verdict === "BLOCK" ? 1 : 0;
-      updatePlanFlags.run(correctionCountOf(plan), blocked, Date.now(), input.planId);
+      commit();
       if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
       publish();
       return lookupPlanNode(input.planId, node.id);
     }
 
-    recordOutcome({
-      planId: input.planId,
-      nodeId: node.id,
-      verdict: null,
-      summary,
-      artifactPaths,
-      actor: "operator",
-      source: "completeNode",
+    if (node.childThreadId) {
+      await stopChildThread(node.childThreadId, "complete this node");
+    }
+    const commit = db.transaction(() => {
+      recordOutcome({
+        planId: input.planId,
+        nodeId: node.id,
+        verdict: null,
+        summary,
+        artifactPaths,
+        actor: attribution.actor,
+        source: attribution.source,
+      });
+      updateNodeStatus.run("done", node.id, input.planId);
+      touchPlan.run(Date.now(), input.planId);
     });
-    updateNodeStatus.run("done", node.id, input.planId);
-    if (node.childThreadId) await closeAttemptForChild(node.childThreadId);
-    touchPlan.run(Date.now(), input.planId);
+    commit();
     if (plan.thread_id) await writeManifest(plan.thread_id, input.planId);
     publish();
     return lookupPlanNode(input.planId, node.id);
   }
 
-  function skipPlanNode(planId: string, nodeId: string): PlanNode {
+  async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
     const node = lookupPlanNode(planId, nodeId);
+    if (node.status === "in_progress" && node.childThreadId) {
+      await stopChildThread(node.childThreadId, "skip this node");
+    }
     updateNodeStatus.run("skipped", node.id, planId);
     touchPlan.run(Date.now(), planId);
     publish();
-    return node;
+    return lookupPlanNode(planId, node.id);
   }
 
-  function resetCriticBlock(planId: string): void {
+  function resetCriticBlock(planId: string, attribution: { actor: string; source: string }): void {
     const plan = requirePlan(planId);
-    updatePlanFlags.run(correctionCountOf(plan), 0, Date.now(), planId);
+    const critic = nodesOf(planId)
+      .filter((node) => node.phase === "critic")
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .at(-1);
+    const commit = db.transaction(() => {
+      updatePlanFlags.run(correctionCountOf(plan), 0, Date.now(), planId);
+      if (critic) {
+        recordOutcome({
+          planId,
+          nodeId: critic.id,
+          verdict: null,
+          summary: "Operator reset Critic BLOCK.",
+          artifactPaths: [],
+          actor: attribution.actor,
+          source: attribution.source,
+        });
+      }
+    });
+    commit();
     publish();
   }
 
@@ -1865,11 +1953,6 @@ export default async function plugin(bb: BbPluginApi) {
     if (readArc(threadId)) {
       throw new Error("A Harness run is already active on this thread.");
     }
-    if (historicalLiveRun(threadId)) {
-      throw new Error(
-        "A historical Milestone run is still marked live on this thread. Stop it with bb harness stop, then start Standard Harness.",
-      );
-    }
   }
 
   async function startManualHarness(
@@ -1877,6 +1960,7 @@ export default async function plugin(bb: BbPluginApi) {
     definition: HarnessDefinition,
   ): Promise<void> {
     const projectId = await resolveProjectId(input.threadId, input.projectId);
+    await stopHistoricalRun(input.threadId);
     assertCanStart(input.threadId);
     const now = Date.now();
     const frozen = snapshotHarness(definition);
@@ -1899,9 +1983,7 @@ export default async function plugin(bb: BbPluginApi) {
       critic_blocked: 0,
     };
     const insertAll = db.transaction(() => {
-      insertPlan.run(row);
-      insertSeedNodes(row.id, frozen);
-      upsertArc.run({
+      insertArc.run({
         thread_id: input.threadId,
         project_id: projectId,
         phase: "explore",
@@ -1909,6 +1991,8 @@ export default async function plugin(bb: BbPluginApi) {
         updated_at: now,
         harness_id: frozen.id,
       });
+      insertPlan.run(row);
+      insertSeedNodes(row.id, frozen);
     });
     try {
       insertAll();
@@ -1924,6 +2008,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     publish();
   }
+
 
   async function startRun(input: z.infer<typeof startRunInputSchema>): Promise<void> {
     const harnessId = resolveHarnessId(input);
@@ -1951,8 +2036,23 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function stopRun(threadId: string): Promise<void> {
     const stoppedHistorical = await stopHistoricalRun(threadId);
-    if (readArc(threadId)) {
-      deleteArc.run(threadId);
+    const arc = readArc(threadId);
+    if (arc) {
+      const plan = planForThread(arc.project_id, threadId);
+      if (plan) {
+        await stopLiveChildren(nodesOf(plan.id), "stop Harness");
+        const settle = db.transaction(() => {
+          for (const node of nodesOf(plan.id)) {
+            if (node.status === "in_progress") {
+              updateNodeStatus.run("skipped", node.id, plan.id);
+            }
+          }
+          deleteArc.run(threadId);
+        });
+        settle();
+      } else {
+        deleteArc.run(threadId);
+      }
       publish();
       return;
     }
@@ -1961,6 +2061,15 @@ export default async function plugin(bb: BbPluginApi) {
       return;
     }
     throw new Error("No Harness run on this thread.");
+  }
+
+  async function reconcileFailedChild(threadId: string): Promise<void> {
+    const row = selectNodeByChild.get(threadId) as NodeRow | undefined;
+    await closeAttemptForChild(threadId);
+    if (!row || row.status !== "in_progress") return;
+    updateNodeStatus.run("pending", row.id, row.plan_id);
+    updateNodeChild.run(null, row.id, row.plan_id);
+    publish();
   }
 
   bb.rpc.register(rpcContract, {
@@ -2003,9 +2112,11 @@ export default async function plugin(bb: BbPluginApi) {
       );
       return { plans: rows.map((row) => toMeta(row)) };
     },
-    getPlan: async ({ id }) => {
+    getPlan: async ({ id, projectId, threadId }) => {
       const row = selectPlan.get(id) as PlanRow | undefined;
-      return { plan: row ? await toFull(row) : null };
+      if (!row) return { plan: null };
+      requirePlanAccess(id, { projectId, threadId }, "read");
+      return { plan: await toFull(row) };
     },
     createPlan: async ({ projectId, threadId, name, seedArc }) => {
       const resolvedProject = threadId
@@ -2033,22 +2144,24 @@ export default async function plugin(bb: BbPluginApi) {
       publish();
       return { plan: await toFull(requirePlan(row.id)) };
     },
-    addNode: async ({ planId, title, detail, phase, deps }) => {
-      const plan = requirePlan(planId);
+    addNode: async ({ planId, title, detail, phase, deps, projectId, threadId }) => {
+      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
       addPlanNode({ planId, title, detail, phase, deps });
       publish();
       return { plan: await toFull(plan) };
     },
-    startNode: ({ planId, nodeId, threadId }) =>
-      startPlanNode(planId, nodeId, threadId),
+    startNode: ({ planId, nodeId, threadId, projectId }) => {
+      requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      return startPlanNode(planId, nodeId, threadId ?? undefined);
+    },
     getRouting: () => ({ routing: currentRouting }),
     setRouting: async ({ slot, choice }) => {
       if (!isRoutingSlot(slot)) throw new Error(`Unknown routing slot ${slot}`);
       const next = { ...currentRouting, [slot]: choice };
       return { routing: await saveRouting(next) };
     },
-    setNodeRouting: async ({ planId, nodeId, choice }) => {
-      const plan = requirePlan(planId);
+    setNodeRouting: async ({ planId, nodeId, choice, projectId, threadId }) => {
+      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
       const node = lookupPlanNode(planId, nodeId);
       updateNodeChoice.run(
         choice?.providerId ?? null,
@@ -2064,22 +2177,23 @@ export default async function plugin(bb: BbPluginApi) {
     },
     suggestChoice: async () => ({ choice: await firstAvailableChoice() }),
     completeNode: async (input) => {
-      const plan = requirePlan(input.planId);
-      await completePlanNode(input);
+      const plan = requirePlanAccess(input.planId, input, "mutate");
+      await completePlanNode(input, { actor: "operator", source: "rpc" });
       return { plan: await toFull(requirePlan(plan.id)) };
     },
-    skipNode: async ({ planId, nodeId }) => {
-      const plan = requirePlan(planId);
-      skipPlanNode(planId, nodeId);
+    skipNode: async ({ planId, nodeId, projectId, threadId }) => {
+      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      await skipPlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
-    reopenNode: async ({ planId, nodeId }) => {
-      requirePlan(planId);
+    reopenNode: async ({ planId, nodeId, projectId, threadId }) => {
+      requirePlanAccess(planId, { projectId, threadId }, "mutate");
       await reopenPlanNode(planId, nodeId);
       return { plan: await toFull(requirePlan(planId)) };
     },
-    resetCriticBlock: async ({ planId }) => {
-      resetCriticBlock(planId);
+    resetCriticBlock: async ({ planId, projectId, threadId }) => {
+      requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      resetCriticBlock(planId, { actor: "operator", source: "rpc" });
       return { plan: await toFull(requirePlan(planId)) };
     },
     initWorkspace: ({ threadId }) => initWorkspace(threadId),
@@ -2141,7 +2255,7 @@ export default async function plugin(bb: BbPluginApi) {
     const out: string[] = [];
     for (let i = 0; i < argv.length; i += 1) {
       const arg = argv[i]!;
-      if (arg === "--json" || arg === "--seed" || arg === "--no-seed") continue;
+      if (arg === "--json" || arg === "--seed" || arg === "--no-seed" || arg === "--milestone") continue;
       if (
         arg === "--thread" ||
         arg === "--phase" ||
@@ -2217,13 +2331,17 @@ export default async function plugin(bb: BbPluginApi) {
           case "start": {
             const missing = needThread();
             if (missing) return missing;
+            if (takeFlag(argv, "--milestone")) {
+              return fail(removedHarnessError("milestone"));
+            }
             const task = takeOption(argv, "--task") ?? rest.join(" ").trim();
             if (!task) return fail("start needs --task <text>");
+            const harnessFlag = takeOption(argv, "--harness");
             await startRun({
               threadId: threadId!,
               projectId: ctx.projectId ?? undefined,
               objective: task,
-              harnessId: takeOption(argv, "--harness"),
+              harnessId: harnessFlag,
             });
             const status = await statusPayload(
               threadId!,
@@ -2325,6 +2443,7 @@ export default async function plugin(bb: BbPluginApi) {
               case "next": {
                 const id = rest[1];
                 if (!id) return fail(`plan ${sub} needs a plan id`);
+                requirePlanAccess(id, { projectId: ctx.projectId, threadId }, "read");
                 const plan = await toFull(requirePlan(id));
                 if (sub === "next") {
                   const next = nextWorkNode(plan.nodes);
@@ -2374,16 +2493,17 @@ export default async function plugin(bb: BbPluginApi) {
                   .split(",")
                   .map((item) => item.trim())
                   .filter(Boolean);
-                const plan = requirePlan(planId);
+                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
                 addPlanNode({ planId, title, phase, deps });
                 publish();
-                const full = await toFull(plan);
+                const full = await toFull(requirePlan(planId));
                 return reply(full, formatPlan(full));
               }
               case "reset-block": {
                 const planId = rest[1];
                 if (!planId) return fail("plan reset-block <plan-id>");
-                resetCriticBlock(planId);
+                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
+                resetCriticBlock(planId, { actor: "operator", source: "cli" });
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
               }
@@ -2396,6 +2516,7 @@ export default async function plugin(bb: BbPluginApi) {
                 if (!planId || !nodeId) {
                   return fail(`plan ${sub} <plan-id> <node-id>`);
                 }
+                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
                 if (sub === "start") {
                   const started = await startPlanNode(planId, nodeId, threadId);
                   return reply(started.plan, formatPlan(started.plan));
@@ -2410,14 +2531,17 @@ export default async function plugin(bb: BbPluginApi) {
                     .split(",")
                     .map((item) => item.trim())
                     .filter(Boolean);
-                  await completePlanNode({
-                    planId,
-                    nodeId,
-                    verdict,
-                    summary: takeOption(argv, "--summary"),
-                    artifactPaths: artifacts.length ? artifacts : undefined,
-                  });
-                } else if (sub === "skip") skipPlanNode(planId, nodeId);
+                  await completePlanNode(
+                    {
+                      planId,
+                      nodeId,
+                      verdict,
+                      summary: takeOption(argv, "--summary"),
+                      artifactPaths: artifacts.length ? artifacts : undefined,
+                    },
+                    { actor: "operator", source: "cli" },
+                  );
+                } else if (sub === "skip") await skipPlanNode(planId, nodeId);
                 else await reopenPlanNode(planId, nodeId);
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
@@ -2564,6 +2688,7 @@ export default async function plugin(bb: BbPluginApi) {
       nodeId: z.string().optional(),
     }),
     async execute({ planId, nodeId }, ctx) {
+      requirePlanAccess(planId, { projectId: ctx.projectId, threadId: ctx.threadId }, "mutate");
       const nodes = nodesOf(planId);
       const target = nodeId
         ? lookupPlanNode(planId, nodeId)
@@ -2593,36 +2718,81 @@ export default async function plugin(bb: BbPluginApi) {
       },
     },
     parameters: completeNodeInputSchema,
-    async execute(input) {
-      requirePlan(input.planId);
-      const completed = await completePlanNode(input);
+    async execute(input, ctx) {
+      requirePlanAccess(input.planId, {
+        projectId: ctx.projectId ?? input.projectId,
+        threadId: ctx.threadId ?? input.threadId,
+      }, "mutate");
+      const completed = await completePlanNode(input, {
+        actor: "parent-agent",
+        source: "harness_complete_node",
+      });
       const plan = await toFull(requirePlan(input.planId));
       const next = nextWorkNode(plan.nodes);
       return JSON.stringify({ completed: completed.id, next, plan }, null, 2);
     },
   });
 
+  function liveChildNode(threadId: string): PlanNode | null {
+    const child = selectNodeByChild.get(threadId) as NodeRow | undefined;
+    if (!child) return null;
+    const node = toNode(child);
+    if (node.status !== "in_progress") return null;
+    const plan = selectPlan.get(child.plan_id) as PlanRow | undefined;
+    if (!plan?.thread_id || !readArc(plan.thread_id)) return null;
+    return node;
+  }
+
+  function parentExecutionInstructions(threadId: string): string | null {
+    const owner = ownerThreadId(threadId);
+    const arc = readArc(owner);
+    if (!arc) return null;
+    const phase = isPhase(arc.phase) ? arc.phase : "explore";
+    const plan = planForThread(arc.project_id, owner);
+    if (plan) {
+      const inflight = activeNode(nodesOf(plan.id));
+      if (inflight && !nodeSpawnsChild(inflight)) {
+        return nodePrompt(inflight, inflight.phase);
+      }
+      const snapshot = snapshotOf(plan);
+      const spec = snapshot?.phases[phase];
+      if (spec && spec.execution === "parent") {
+        return nodePrompt(
+          {
+            id: `${plan.id}-${phase}`,
+            title: spec.title,
+            detail: spec.detail,
+            phase,
+            status: "pending",
+            deps: [],
+            sortOrder: 0,
+          },
+          phase,
+        );
+      }
+    }
+    return [
+      `You are on the ${PHASE_COPY[phase].label} phase of an explicit Harness.`,
+      PHASE_COPY[phase].summary,
+      "Explore and Plan stay on this parent thread unless a frozen custom definition sets child execution.",
+      "Worker, Critic, and Promote spawn visible children by default.",
+      "The parent operator records Critic APPROVE, REWORK, or BLOCK.",
+      "Work one DAG node at a time.",
+    ].join(" ");
+  }
+
   bb.agents.configure((context) => {
-    const child = selectNodeByChild.get(context.thread.id) as NodeRow | undefined;
+    const child = liveChildNode(context.thread.id);
     if (child) {
-      const node = toNode(child);
       return {
-        tools: ["harness_get_arc", "harness_complete_node"],
-        skills: pluginSkillsFor(node.skills ?? []),
-        instructions: [
-          nodePrompt(node, node.phase),
-          (node.skills ?? []).length
-            ? "Skill names are BB references recorded on this node. This plugin injects only its own harness-arc skill when listed; other names are not silently rewritten."
-            : null,
-        ]
-          .filter(Boolean)
-          .join(" "),
+        tools: ["harness_get_arc"],
+        skills: [PLUGIN_SKILL_NAME],
+        instructions: nodePrompt(child, child.phase),
       };
     }
     const owner = ownerThreadId(context.thread.id);
     const arc = readArc(owner);
     if (arc) {
-      const phase = isPhase(arc.phase) ? arc.phase : "explore";
       return {
         tools: [
           "harness_get_arc",
@@ -2631,15 +2801,8 @@ export default async function plugin(bb: BbPluginApi) {
           "harness_next_node",
           "harness_complete_node",
         ],
-        skills: [],
-        instructions: [
-          `You are on the ${PHASE_COPY[phase].label} phase of an explicit Harness.`,
-          PHASE_COPY[phase].summary,
-          "Explore and Plan stay on this parent thread unless a frozen custom definition sets child execution.",
-          "Worker, Critic, and Promote spawn visible children by default.",
-          "Critic completes with APPROVE, REWORK, or BLOCK.",
-          "Work one DAG node at a time.",
-        ].join(" "),
+        skills: [PLUGIN_SKILL_NAME],
+        instructions: parentExecutionInstructions(context.thread.id) ?? "",
       };
     }
     return { tools: [], skills: [] };
@@ -2647,15 +2810,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.agents.contributeInstructions(({ threadId, projectId }) => {
     if (!threadId || !projectId) return null;
-    const child = selectNodeByChild.get(threadId) as NodeRow | undefined;
-    if (child) {
-      const node = toNode(child);
-      return nodePrompt(node, node.phase);
-    }
-    const arc = readArc(threadId);
-    if (!arc) return null;
-    const phase = isPhase(arc.phase) ? arc.phase : "explore";
-    return `${PHASE_COPY[phase].label}: ${PHASE_COPY[phase].summary} Explore and Plan stay on the parent unless customized. Worker, Critic, and Promote spawn children by default. Critic uses APPROVE, REWORK, or BLOCK.`;
+    const child = liveChildNode(threadId);
+    if (child) return nodePrompt(child, child.phase);
+    return parentExecutionInstructions(threadId);
   });
 
   const refreshChild = ({ thread }: { thread: { id: string } }) => {
@@ -2668,8 +2825,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   bb.events.on("thread.active", refreshChild);
   bb.events.on("thread.failed", (payload) => {
-    void closeAttemptForChild(payload.thread.id);
-    refreshChild(payload);
+    void reconcileFailedChild(payload.thread.id).then(() => refreshChild(payload));
   });
 
   bb.onDispose(() => {
