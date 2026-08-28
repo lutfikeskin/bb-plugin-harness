@@ -278,7 +278,7 @@ function ManualHarnessView({
                 <span className="mt-0.5 font-mono text-xs text-muted-foreground">
                   {node.status === "done"
                     ? "[x]"
-                    : node.status === "in_progress"
+                    : node.status === "in_progress" || node.status === "starting"
                       ? "[>]"
                       : node.status === "skipped"
                         ? "[-]"
@@ -306,7 +306,7 @@ function ManualHarnessView({
                       Stays on the parent thread
                     </p>
                   ) : null}
-                  {node.status === "pending" || node.status === "in_progress" ? (
+                  {node.status === "pending" || node.status === "in_progress" || node.status === "starting" ? (
                     <div className="mt-2">
                       <SlotModelPicker
                         choice={persistedPlanChoice(node)}
@@ -347,7 +347,7 @@ function ManualHarnessView({
                   ) : null}
                 </div>
                 <div className="flex flex-col gap-1">
-                  {node.status === "pending" || (node.status === "in_progress" && !node.childThreadId) ? (
+                  {node.status === "pending" ? (
                     <Button size="sm" disabled={pending} onClick={() => onStartNode(node.id)}>
                       Start
                     </Button>

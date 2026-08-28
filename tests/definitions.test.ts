@@ -15,6 +15,7 @@ import {
   validateHarnessDraft,
 } from "../lib/definitions";
 import {
+  activeNode,
   namespacedNodeId,
   parseExecutionChoice,
   resolveDependencyIds,
@@ -171,6 +172,9 @@ describe("harness definitions", () => {
     const generated = namespacedNodeId("planx", "Extra worker", taken, () => "z");
     expect(generated.startsWith("planx-")).toBe(true);
     expect(taken.has(generated)).toBe(false);
+    expect(activeNode(nodes)).toBeNull();
+    nodes[0]!.status = "starting";
+    expect(activeNode(nodes)?.id).toBe("planx-explore");
   });
 
   it("trims routing provider and model and rejects blanks", () => {

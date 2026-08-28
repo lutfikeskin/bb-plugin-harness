@@ -10,6 +10,7 @@ export type Phase = (typeof PHASES)[number];
 
 export const NODE_STATUSES = [
   "pending",
+  "starting",
   "in_progress",
   "done",
   "skipped",
@@ -311,7 +312,7 @@ export function readyNodes<T extends PlanNode>(nodes: readonly T[]): T[] {
 }
 
 export function activeNode<T extends PlanNode>(nodes: readonly T[]): T | null {
-  return nodes.find((node) => node.status === "in_progress") ?? null;
+  return nodes.find((node) => node.status === "in_progress" || node.status === "starting") ?? null;
 }
 
 export function nextWorkNode<T extends PlanNode>(nodes: readonly T[]): T | null {

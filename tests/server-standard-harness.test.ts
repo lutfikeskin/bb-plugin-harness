@@ -16,6 +16,8 @@ async function loadPlugin(options?: {
   stopError?: string;
   mkdirError?: string;
   events?: unknown[];
+  spawnGate?: Promise<void>;
+  defaultExecutionOptions?: { model: string } | null;
 }) {
   let childSeq = 0;
   let stopError = options?.stopError;
@@ -27,7 +29,6 @@ async function loadPlugin(options?: {
         projectId: PROJECT,
         environmentId: ENV,
         providerId: "pi",
-        model: "inherited-model",
       }),
     ],
   ]);
@@ -55,10 +56,12 @@ async function loadPlugin(options?: {
           if (!thread) throw new Error(`missing thread ${threadId}`);
           return thread;
         },
+        defaultExecutionOptions: async () => options?.defaultExecutionOptions ?? null,
         spawn: async (args: Record<string, unknown>) => {
           if (!options?.allowSpawn) {
             throw new Error("this start must not spawn a child");
           }
+          if (options.spawnGate) await options.spawnGate;
           childSeq += 1;
           const child = makeThreadResponse({
             id: `thr_child_${childSeq}`,
@@ -622,7 +625,7 @@ describe("standard and custom harnesses", () => {
         projectId: "proj_other",
         threadId: PARENT,
       }),
-    ).rejects.toThrow(/does not belong/);
+    ).rejects.toThrow(/does not match thread/);
     await expect(
       host.harness.behavior.callRpc("completeNode", {
         planId,
@@ -999,13 +1002,14 @@ describe("standard and custom harnesses", () => {
       plan: {
         nodes: Array<{
           phase: string;
-          attempt: { model: string | null; providerId: string | null } | null;
+          attempt: { model: string | null; providerId: string | null; source: string } | null;
         }>;
       };
     };
     expect(live.plan.nodes.find((node) => node.phase === "worker")?.attempt).toMatchObject({
-      providerId: "pi",
-      model: "inherited-model",
+      providerId: null,
+      model: null,
+      source: "inherited-unknown",
     });
     const done = (await host.harness.behavior.callRpc("completeNode", {
       planId,
@@ -1022,5 +1026,178 @@ describe("standard and custom harnesses", () => {
       };
     };
     expect(done.plan.nodes.find((node) => node.phase === "worker")?.attempts[0]?.tokens.total).toBe(4);
+  });
+
+  it("spawns only one child when Start races after a pending claim", async () => {
+    let releaseSpawn: (() => void) | undefined;
+    const spawnGate = new Promise<void>((resolve) => {
+      releaseSpawn = resolve;
+    });
+    host = await loadPlugin({ allowSpawn: true, spawnGate });
+    const started = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "One child",
+    })) as { plan: { id: string } };
+    const planId = started.plan.id;
+    for (const alias of ["explore", "plan"]) {
+      await host.harness.behavior.callRpc("startNode", {
+        planId,
+        nodeId: alias,
+        threadId: PARENT,
+        projectId: PROJECT,
+      });
+      await host.harness.behavior.callRpc("completeNode", {
+        planId,
+        nodeId: alias,
+        projectId: PROJECT,
+        threadId: PARENT,
+      });
+    }
+    const first = host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    let claimed = false;
+    for (let i = 0; i < 50 && !claimed; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+      const peek = (await host.harness.behavior.callRpc("getPlan", {
+        id: planId,
+        projectId: PROJECT,
+        threadId: PARENT,
+      })) as { plan: { nodes: Array<{ phase: string; status: string }> } };
+      claimed = peek.plan.nodes.find((node) => node.phase === "worker")?.status === "starting";
+    }
+    expect(claimed).toBe(true);
+    const second = (await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { nodes: Array<{ phase: string; status: string }> } };
+    expect(second.plan.nodes.find((node) => node.phase === "worker")?.status).toBe("starting");
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    releaseSpawn?.();
+    await first;
+    expect(host.harness.inspection.sdk.callsTo("threads.spawn")).toHaveLength(1);
+    const after = (await host.harness.behavior.callRpc("getPlan", {
+      id: planId,
+      projectId: PROJECT,
+      threadId: PARENT,
+    })) as { plan: { nodes: Array<{ phase: string; status: string; childThreadId: string | null }> } };
+    expect(after.plan.nodes.find((node) => node.phase === "worker")).toMatchObject({
+      status: "in_progress",
+      childThreadId: "thr_child_1",
+    });
+  });
+
+  it("does not let a failed-child event overwrite a completed node", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const started = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Complete then fail",
+    })) as { plan: { id: string } };
+    const planId = started.plan.id;
+    for (const alias of ["explore", "plan"]) {
+      await host.harness.behavior.callRpc("startNode", {
+        planId,
+        nodeId: alias,
+        threadId: PARENT,
+        projectId: PROJECT,
+      });
+      await host.harness.behavior.callRpc("completeNode", {
+        planId,
+        nodeId: alias,
+        projectId: PROJECT,
+        threadId: PARENT,
+      });
+    }
+    const live = (await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { nodes: Array<{ phase: string; childThreadId: string | null }> } };
+    const childId = live.plan.nodes.find((node) => node.phase === "worker")!.childThreadId!;
+    await host.harness.behavior.callRpc("completeNode", {
+      planId,
+      nodeId: "worker",
+      projectId: PROJECT,
+      threadId: PARENT,
+    });
+    const child = host.threads.get(childId) as ReturnType<typeof makeThreadResponse>;
+    await host.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: child,
+      error: "late failure",
+    });
+    const after = (await host.harness.behavior.callRpc("getPlan", {
+      id: planId,
+      projectId: PROJECT,
+      threadId: PARENT,
+    })) as {
+      plan: {
+        nodes: Array<{ phase: string; status: string; childThreadId: string | null }>;
+      };
+    };
+    expect(after.plan.nodes.find((node) => node.phase === "worker")).toMatchObject({
+      status: "done",
+      childThreadId: childId,
+    });
+  });
+
+  it("does not let a failed-child event overwrite a stopped node", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const started = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Stop then fail",
+    })) as { plan: { id: string } };
+    const planId = started.plan.id;
+    for (const alias of ["explore", "plan"]) {
+      await host.harness.behavior.callRpc("startNode", {
+        planId,
+        nodeId: alias,
+        threadId: PARENT,
+        projectId: PROJECT,
+      });
+      await host.harness.behavior.callRpc("completeNode", {
+        planId,
+        nodeId: alias,
+        projectId: PROJECT,
+        threadId: PARENT,
+      });
+    }
+    const live = (await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { nodes: Array<{ phase: string; childThreadId: string | null }> } };
+    const childId = live.plan.nodes.find((node) => node.phase === "worker")!.childThreadId!;
+    await host.harness.behavior.callRpc("stopRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    const child = host.threads.get(childId) as ReturnType<typeof makeThreadResponse>;
+    await host.harness.behavior.emitThreadEvent("thread.failed", {
+      thread: child,
+      error: "late failure after stop",
+    });
+    const after = (await host.harness.behavior.callRpc("getPlan", {
+      id: planId,
+      projectId: PROJECT,
+      threadId: PARENT,
+    })) as {
+      plan: {
+        nodes: Array<{ phase: string; status: string; childThreadId: string | null }>;
+      };
+    };
+    expect(after.plan.nodes.find((node) => node.phase === "worker")).toMatchObject({
+      status: "skipped",
+      childThreadId: childId,
+    });
   });
 });

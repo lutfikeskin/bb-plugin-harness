@@ -56,6 +56,8 @@ Native tools: `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harn
 
 Settings → Role routing picks a real provider and model for Explore/Plan (parent on Standard), Worker, Critic, and Promote.
 
-A DAG node can override that slot. Unset means inherit the parent thread's provider/model.
+A DAG node can override that slot. Unset means inherit the parent thread's provider/model when BB exposes `defaultExecutionOptions`. Otherwise attempt telemetry records `inherited-unknown` with null provider/model. No cost is invented.
 
 Do not auto-complete a node when the child goes idle. The operator clicks Done or records a Critic verdict.
+
+Plugin RPC is full-trust local UI/CLI. It is not a tenant auth boundary. Plan mutations require the owning parent thread.

@@ -2,6 +2,12 @@
 //
 // Explore → Plan → Worker → Critic → Promote. Spawn uses snapshotted execution
 // mode. Role routing is stored in plugin KV. Historical Milestone tables remain.
+//
+// Threat model: BB plugins are full-trust in-process code. Plugin RPC has no
+// authenticated caller distinct from the local user. These checks exist to make
+// accidental/stale cross-project or child-thread plan mutation impossible, not
+// to defend against a malicious local plugin. RPC is not a tenant security
+// boundary.
 import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -13,6 +19,7 @@ import {
   activeNode,
   formatChoice,
   isPhase,
+  isNodeStatus,
   isRoutingSlot,
   nextPhase,
   nextWorkNode,
@@ -30,7 +37,6 @@ import {
   workerOrdinal,
   type ExecutionChoice,
   type ExecutionMode,
-  type NodeStatus,
   type Phase,
   type PlanNode,
   type RoleRouting,
@@ -82,7 +88,7 @@ const HISTORICAL_LIVE_RUN =
   "('configuring','running','awaiting_plan_approval','awaiting_correction_approval')";
 
 const phaseSchema = z.enum(PHASES);
-const nodeStatusSchema = z.enum(["pending", "in_progress", "done", "skipped"]);
+const nodeStatusSchema = z.enum(["pending", "starting", "in_progress", "done", "skipped"]);
 const executionModeSchema = z.enum(["parent", "child"]);
 const criticVerdictSchema = z.enum(CRITIC_VERDICTS);
 
@@ -272,15 +278,15 @@ const startRunInputSchema = z.object({
 const completeNodeInputSchema = z.object({
   planId: z.string(),
   nodeId: z.string(),
+  threadId: z.string(),
   projectId: z.string().optional(),
-  threadId: z.string().optional(),
   verdict: criticVerdictSchema.optional(),
   summary: z.string().trim().max(MAX_RESULT_SUMMARY).optional(),
   artifactPaths: z.array(z.string().trim().min(1).max(MAX_ARTIFACT_PATH_LENGTH)).max(MAX_ARTIFACT_PATHS).optional(),
 });
 const planAccessSchema = z.object({
+  threadId: z.string(),
   projectId: z.string().optional(),
-  threadId: z.string().optional(),
 });
 
 export const rpcContract = defineRpcContract({
@@ -327,8 +333,8 @@ export const rpcContract = defineRpcContract({
   },
   createPlan: {
     input: z.object({
-      projectId: z.string(),
-      threadId: z.string().nullable().optional(),
+      projectId: z.string().optional(),
+      threadId: z.string(),
       name: z.string().trim().min(1).max(200),
       seedArc: z.boolean().optional(),
     }),
@@ -391,7 +397,10 @@ export const rpcContract = defineRpcContract({
     output: z.object({ plan: planFullSchema }),
   },
   initWorkspace: {
-    input: z.object({ threadId: z.string() }),
+    input: z.object({
+      threadId: z.string(),
+      projectId: z.string().optional(),
+    }),
     output: z.object({
       path: z.string(),
       written: z.array(z.string()),
@@ -514,12 +523,6 @@ function parseSkillsJson(raw: string | null): string[] {
   }
 }
 
-function readThreadModel(thread: unknown): string | null {
-  if (!thread || typeof thread !== "object") return null;
-  const model = (thread as { model?: unknown }).model;
-  return typeof model === "string" && model.trim() ? model : null;
-}
-
 function toNode(row: NodeRow): PlanNode {
   const phase = isPhase(row.phase) ? row.phase : "worker";
   const execution =
@@ -531,7 +534,7 @@ function toNode(row: NodeRow): PlanNode {
     title: row.title,
     detail: row.detail,
     phase,
-    status: row.status as NodeStatus,
+    status: isNodeStatus(row.status) ? row.status : "pending",
     deps: parseDeps(row.deps),
     sortOrder: row.sort_order,
     childThreadId: row.child_thread_id ?? null,
@@ -786,6 +789,24 @@ export default async function plugin(bb: BbPluginApi) {
   );
   const updateNodeStatus = db.prepare(
     "UPDATE plan_nodes SET status = ? WHERE id = ? AND plan_id = ?",
+  );
+  const claimNodeStatus = db.prepare(
+    "UPDATE plan_nodes SET status = ? WHERE id = ? AND plan_id = ? AND status = ?",
+  );
+  const recoverStartingNode = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'pending'
+     WHERE id = ? AND plan_id = ? AND status = 'starting' AND child_thread_id IS NULL`,
+  );
+  const attachStartingChild = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'in_progress', child_thread_id = ?
+     WHERE id = ? AND plan_id = ? AND status = 'starting'`,
+  );
+  const casFailedChild = db.prepare(
+    `UPDATE plan_nodes
+     SET status = 'pending', child_thread_id = NULL
+     WHERE id = ? AND plan_id = ? AND status = 'in_progress' AND child_thread_id = ?`,
   );
   const selectNodeByChild = db.prepare(
     "SELECT * FROM plan_nodes WHERE child_thread_id = ?",
@@ -1064,38 +1085,32 @@ export default async function plugin(bb: BbPluginApi) {
     return row;
   }
 
-  type PlanAccess = {
-    projectId?: string | null;
-    threadId?: string | null;
-  };
-
-  function planCallerRole(plan: PlanRow, access: PlanAccess): "owner" | "child" | "project" | "denied" {
-    if (access.projectId && access.projectId !== plan.project_id) return "denied";
-    if (access.threadId) {
-      if (plan.thread_id && access.threadId === plan.thread_id) return "owner";
-      const child = selectNodeByChild.get(access.threadId) as NodeRow | undefined;
-      if (child && child.plan_id === plan.id) return "child";
-      return "denied";
+  async function requireParentPlan(
+    planId: string,
+    threadId: string | undefined,
+    claimedProjectId: string | undefined,
+    mode: "read" | "mutate",
+  ): Promise<PlanRow> {
+    if (!threadId) {
+      throw new Error("Plan operations require the owning parent thread.");
     }
-    if (access.projectId === plan.project_id) return "project";
-    return "denied";
-  }
-
-  function requirePlanAccess(planId: string, access: PlanAccess, mode: "read" | "mutate"): PlanRow {
+    const thread = await bb.sdk.threads.get({ threadId });
+    if (claimedProjectId && claimedProjectId !== thread.projectId) {
+      throw new Error(`projectId ${claimedProjectId} does not match thread ${threadId}.`);
+    }
     const plan = requirePlan(planId);
-    const role = planCallerRole(plan, access);
-    if (role === "denied") {
-      throw new Error("This plan does not belong to this project or thread.");
+    if (plan.thread_id === thread.id && plan.project_id === thread.projectId) {
+      return plan;
     }
-    if (mode === "mutate" && role !== "owner") {
-      if (role === "child") {
+    if (mode === "mutate") {
+      const mapped = selectNodeByChild.get(threadId) as NodeRow | undefined;
+      if (mapped && mapped.plan_id === plan.id) {
         throw new Error(
           "Child threads cannot complete, skip, or rework Harness nodes. The parent operator owns those actions.",
         );
       }
-      throw new Error("Plan mutations require the owning thread.");
     }
-    return plan;
+    throw new Error("This plan does not belong to this project or thread.");
   }
 
   function planForThread(projectId: string, threadId: string): PlanRow | null {
@@ -1290,7 +1305,10 @@ export default async function plugin(bb: BbPluginApi) {
     predicate: (node: PlanNode) => boolean = () => true,
   ): Promise<PlanNode[]> {
     const live = nodes.filter(
-      (node) => node.status === "in_progress" && node.childThreadId && predicate(node),
+      (node) =>
+        (node.status === "in_progress" || node.status === "starting") &&
+        node.childThreadId &&
+        predicate(node),
     );
     for (const node of live) {
       await stopChildThread(node.childThreadId!, label);
@@ -1416,6 +1434,29 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function inheritedAttemptRouting(
+    parentThreadId: string,
+    parentProviderId: string,
+  ): Promise<{
+    providerId: string | null;
+    model: string | null;
+    source: string;
+  }> {
+    try {
+      const options = await bb.sdk.threads.defaultExecutionOptions({ threadId: parentThreadId });
+      if (options?.model) {
+        return {
+          providerId: parentProviderId,
+          model: options.model,
+          source: "thread/defaultExecutionOptions",
+        };
+      }
+    } catch {
+      // Missing defaults stay unknown. Do not invent a model id.
+    }
+    return { providerId: null, model: null, source: "inherited-unknown" };
+  }
+
   async function startPlanNode(
     planId: string,
     nodeId: string,
@@ -1443,32 +1484,45 @@ export default async function plugin(bb: BbPluginApi) {
     if (node.phase === "promote" && criticBlockedOf(plan)) {
       throw new Error("Promote is blocked until the operator resets the Critic BLOCK.");
     }
-    if (node.status === "in_progress" && node.childThreadId) {
+    if (node.status === "in_progress" || node.status === "starting") {
       return { plan: await toFull(plan) };
     }
 
-    updateNodeStatus.run("in_progress", node.id, planId);
+    const spawns = nodeSpawnsChild(node);
+    // Claim before any await so a concurrent Start cannot spawn a second child.
+    const claimed = claimNodeStatus.run(
+      spawns ? "starting" : "in_progress",
+      node.id,
+      planId,
+      "pending",
+    );
+    if (claimed.changes !== 1) {
+      return { plan: await toFull(requirePlan(planId)) };
+    }
     touchPlan.run(Date.now(), planId);
 
-    if (!nodeSpawnsChild(node)) {
+    if (!spawns) {
       publish();
-      return { plan: await toFull(plan) };
+      return { plan: await toFull(requirePlan(planId)) };
     }
 
     const parentId = plan.thread_id ?? parentThreadId;
+    const recoverClaim = () => {
+      recoverStartingNode.run(node.id, planId);
+    };
     if (!parentId) {
-      updateNodeStatus.run("pending", node.id, planId);
+      recoverClaim();
       throw new Error("Need a parent thread to spawn a child for this node's execution mode.");
     }
-    const parent = await bb.sdk.threads.get({ threadId: parentId });
-    if (!parent.environmentId) {
-      updateNodeStatus.run("pending", node.id, planId);
-      throw new Error("Parent thread has no environment; cannot spawn a child.");
-    }
 
-    const choice = resolvedChoice(nodes, node);
-    const title = `${PHASE_COPY[node.phase].label}: ${node.title}`.slice(0, 80);
     try {
+      const parent = await bb.sdk.threads.get({ threadId: parentId });
+      if (!parent.environmentId) {
+        recoverClaim();
+        throw new Error("Parent thread has no environment; cannot spawn a child.");
+      }
+      const choice = resolvedChoice(nodes, node);
+      const title = `${PHASE_COPY[node.phase].label}: ${node.title}`.slice(0, 80);
       const child = await bb.sdk.threads.spawn({
         prompt: nodePrompt(node, node.phase),
         parentThreadId: parent.id,
@@ -1496,30 +1550,43 @@ export default async function plugin(bb: BbPluginApi) {
             }
           : {}),
       });
-      const parentModel = readThreadModel(parent);
-      const childModel = readThreadModel(child);
-      updateNodeChild.run(child.id, node.id, planId);
-      const now = Date.now();
-      insertAttempt.run({
-        id: randomUUID(),
-        plan_id: planId,
-        node_id: node.id,
-        child_thread_id: child.id,
-        provider_id: choice?.providerId ?? parent.providerId ?? child.providerId ?? null,
-        model: choice?.model ?? parentModel ?? childModel,
-        started_at: now,
-        ended_at: null,
-        duration_ms: null,
-        tokens_input: null,
-        tokens_cached: null,
-        tokens_output: null,
-        tokens_reasoning: null,
-        tokens_total: null,
-        source: "thread/tokenUsage/updated",
-        created_at: now,
-      });
+      const routing = choice
+        ? {
+            providerId: choice.providerId,
+            model: choice.model,
+            source: "explicit-routing",
+          }
+        : await inheritedAttemptRouting(parent.id, parent.providerId);
+      const attached = db.transaction(() => {
+        const result = attachStartingChild.run(child.id, node.id, planId);
+        if (result.changes !== 1) return false;
+        const now = Date.now();
+        insertAttempt.run({
+          id: randomUUID(),
+          plan_id: planId,
+          node_id: node.id,
+          child_thread_id: child.id,
+          provider_id: routing.providerId,
+          model: routing.model,
+          started_at: now,
+          ended_at: null,
+          duration_ms: null,
+          tokens_input: null,
+          tokens_cached: null,
+          tokens_output: null,
+          tokens_reasoning: null,
+          tokens_total: null,
+          source: routing.source,
+          created_at: now,
+        });
+        return true;
+      })();
+      if (!attached) {
+        recoverClaim();
+        throw new Error("Node start claim was lost before the child could be attached.");
+      }
     } catch (error) {
-      updateNodeStatus.run("pending", node.id, planId);
+      recoverClaim();
       throw error;
     }
     publish();
@@ -1788,7 +1855,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
     const node = lookupPlanNode(planId, nodeId);
-    if (node.status === "in_progress" && node.childThreadId) {
+    if (
+      (node.status === "in_progress" || node.status === "starting") &&
+      node.childThreadId
+    ) {
       await stopChildThread(node.childThreadId, "skip this node");
     }
     updateNodeStatus.run("skipped", node.id, planId);
@@ -1863,7 +1933,7 @@ export default async function plugin(bb: BbPluginApi) {
       const mark =
         node.status === "done"
           ? "x"
-          : node.status === "in_progress"
+          : node.status === "in_progress" || node.status === "starting"
             ? ">"
             : node.status === "skipped"
               ? "-"
@@ -1882,7 +1952,8 @@ export default async function plugin(bb: BbPluginApi) {
     return lines.join("\n");
   }
 
-  async function initWorkspace(threadId: string) {
+  async function initWorkspace(threadId: string, claimedProjectId?: string) {
+    await resolveProjectId(threadId, claimedProjectId);
     const { hostId, path } = await resolveWorkspace(threadId);
     const written: string[] = [];
     const skipped: string[] = [];
@@ -2034,16 +2105,20 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
-  async function stopRun(threadId: string): Promise<void> {
+  async function stopRun(threadId: string, claimedProjectId?: string): Promise<void> {
+    const projectId = await resolveProjectId(threadId, claimedProjectId);
     const stoppedHistorical = await stopHistoricalRun(threadId);
     const arc = readArc(threadId);
     if (arc) {
+      if (arc.project_id !== projectId) {
+        throw new Error(`projectId ${arc.project_id} does not match thread ${threadId}.`);
+      }
       const plan = planForThread(arc.project_id, threadId);
       if (plan) {
         await stopLiveChildren(nodesOf(plan.id), "stop Harness");
         const settle = db.transaction(() => {
           for (const node of nodesOf(plan.id)) {
-            if (node.status === "in_progress") {
+            if (node.status === "in_progress" || node.status === "starting") {
               updateNodeStatus.run("skipped", node.id, plan.id);
             }
           }
@@ -2064,12 +2139,12 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   async function reconcileFailedChild(threadId: string): Promise<void> {
-    const row = selectNodeByChild.get(threadId) as NodeRow | undefined;
     await closeAttemptForChild(threadId);
-    if (!row || row.status !== "in_progress") return;
-    updateNodeStatus.run("pending", row.id, row.plan_id);
-    updateNodeChild.run(null, row.id, row.plan_id);
-    publish();
+    // Re-read after telemetry close, then CAS. Done/skipped/stopped/new attempts stay.
+    const row = selectNodeByChild.get(threadId) as NodeRow | undefined;
+    if (!row) return;
+    const changed = casFailedChild.run(row.id, row.plan_id, threadId);
+    if (changed.changes === 1) publish();
   }
 
   bb.rpc.register(rpcContract, {
@@ -2115,18 +2190,16 @@ export default async function plugin(bb: BbPluginApi) {
     getPlan: async ({ id, projectId, threadId }) => {
       const row = selectPlan.get(id) as PlanRow | undefined;
       if (!row) return { plan: null };
-      requirePlanAccess(id, { projectId, threadId }, "read");
+      await requireParentPlan(id, threadId, projectId, "read");
       return { plan: await toFull(row) };
     },
     createPlan: async ({ projectId, threadId, name, seedArc }) => {
-      const resolvedProject = threadId
-        ? await resolveProjectId(threadId, projectId)
-        : projectId;
+      const resolvedProject = await resolveProjectId(threadId, projectId);
       const now = Date.now();
       const row: PlanRow = {
         id: shortId(),
         project_id: resolvedProject,
-        thread_id: threadId ?? null,
+        thread_id: threadId,
         name,
         created_at: now,
         updated_at: now,
@@ -2145,14 +2218,14 @@ export default async function plugin(bb: BbPluginApi) {
       return { plan: await toFull(requirePlan(row.id)) };
     },
     addNode: async ({ planId, title, detail, phase, deps, projectId, threadId }) => {
-      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
       addPlanNode({ planId, title, detail, phase, deps });
       publish();
       return { plan: await toFull(plan) };
     },
-    startNode: ({ planId, nodeId, threadId, projectId }) => {
-      requirePlanAccess(planId, { projectId, threadId }, "mutate");
-      return startPlanNode(planId, nodeId, threadId ?? undefined);
+    startNode: async ({ planId, nodeId, threadId, projectId }) => {
+      await requireParentPlan(planId, threadId, projectId, "mutate");
+      return startPlanNode(planId, nodeId, threadId);
     },
     getRouting: () => ({ routing: currentRouting }),
     setRouting: async ({ slot, choice }) => {
@@ -2161,7 +2234,7 @@ export default async function plugin(bb: BbPluginApi) {
       return { routing: await saveRouting(next) };
     },
     setNodeRouting: async ({ planId, nodeId, choice, projectId, threadId }) => {
-      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
       const node = lookupPlanNode(planId, nodeId);
       updateNodeChoice.run(
         choice?.providerId ?? null,
@@ -2177,26 +2250,26 @@ export default async function plugin(bb: BbPluginApi) {
     },
     suggestChoice: async () => ({ choice: await firstAvailableChoice() }),
     completeNode: async (input) => {
-      const plan = requirePlanAccess(input.planId, input, "mutate");
+      const plan = await requireParentPlan(input.planId, input.threadId, input.projectId, "mutate");
       await completePlanNode(input, { actor: "operator", source: "rpc" });
       return { plan: await toFull(requirePlan(plan.id)) };
     },
     skipNode: async ({ planId, nodeId, projectId, threadId }) => {
-      const plan = requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      const plan = await requireParentPlan(planId, threadId, projectId, "mutate");
       await skipPlanNode(planId, nodeId);
       return { plan: await toFull(plan) };
     },
     reopenNode: async ({ planId, nodeId, projectId, threadId }) => {
-      requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      await requireParentPlan(planId, threadId, projectId, "mutate");
       await reopenPlanNode(planId, nodeId);
       return { plan: await toFull(requirePlan(planId)) };
     },
     resetCriticBlock: async ({ planId, projectId, threadId }) => {
-      requirePlanAccess(planId, { projectId, threadId }, "mutate");
+      await requireParentPlan(planId, threadId, projectId, "mutate");
       resetCriticBlock(planId, { actor: "operator", source: "rpc" });
       return { plan: await toFull(requirePlan(planId)) };
     },
-    initWorkspace: ({ threadId }) => initWorkspace(threadId),
+    initWorkspace: ({ threadId, projectId }) => initWorkspace(threadId, projectId),
     startRun: async (input) => {
       await startRun(input);
       return statusPayload(
@@ -2205,7 +2278,7 @@ export default async function plugin(bb: BbPluginApi) {
       );
     },
     stopRun: async ({ threadId, projectId }) => {
-      await stopRun(threadId);
+      await stopRun(threadId, projectId);
       return statusPayload(threadId, await resolveProjectId(threadId, projectId));
     },
     listHarnesses: () => ({ harnesses: catalogHarnesses() }),
@@ -2352,7 +2425,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "stop": {
             const missing = needThread();
             if (missing) return missing;
-            await stopRun(threadId!);
+            await stopRun(threadId!, ctx.projectId);
             const status = await statusPayload(
               threadId!,
               await resolveProjectId(threadId!, ctx.projectId),
@@ -2403,7 +2476,7 @@ export default async function plugin(bb: BbPluginApi) {
           case "init": {
             const missing = needThread();
             if (missing) return missing;
-            const result = await initWorkspace(threadId!);
+            const result = await initWorkspace(threadId!, ctx.projectId);
             return reply(
               result,
               [
@@ -2443,7 +2516,7 @@ export default async function plugin(bb: BbPluginApi) {
               case "next": {
                 const id = rest[1];
                 if (!id) return fail(`plan ${sub} needs a plan id`);
-                requirePlanAccess(id, { projectId: ctx.projectId, threadId }, "read");
+                await requireParentPlan(id, threadId, ctx.projectId, "read");
                 const plan = await toFull(requirePlan(id));
                 if (sub === "next") {
                   const next = nextWorkNode(plan.nodes);
@@ -2493,7 +2566,7 @@ export default async function plugin(bb: BbPluginApi) {
                   .split(",")
                   .map((item) => item.trim())
                   .filter(Boolean);
-                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
                 addPlanNode({ planId, title, phase, deps });
                 publish();
                 const full = await toFull(requirePlan(planId));
@@ -2502,7 +2575,7 @@ export default async function plugin(bb: BbPluginApi) {
               case "reset-block": {
                 const planId = rest[1];
                 if (!planId) return fail("plan reset-block <plan-id>");
-                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
                 resetCriticBlock(planId, { actor: "operator", source: "cli" });
                 const plan = await toFull(requirePlan(planId));
                 return reply(plan, formatPlan(plan));
@@ -2516,7 +2589,7 @@ export default async function plugin(bb: BbPluginApi) {
                 if (!planId || !nodeId) {
                   return fail(`plan ${sub} <plan-id> <node-id>`);
                 }
-                requirePlanAccess(planId, { projectId: ctx.projectId, threadId }, "mutate");
+                await requireParentPlan(planId, threadId, ctx.projectId, "mutate");
                 if (sub === "start") {
                   const started = await startPlanNode(planId, nodeId, threadId);
                   return reply(started.plan, formatPlan(started.plan));
@@ -2535,6 +2608,7 @@ export default async function plugin(bb: BbPluginApi) {
                     {
                       planId,
                       nodeId,
+                      threadId: threadId!,
                       verdict,
                       summary: takeOption(argv, "--summary"),
                       artifactPaths: artifacts.length ? artifacts : undefined,
@@ -2688,7 +2762,7 @@ export default async function plugin(bb: BbPluginApi) {
       nodeId: z.string().optional(),
     }),
     async execute({ planId, nodeId }, ctx) {
-      requirePlanAccess(planId, { projectId: ctx.projectId, threadId: ctx.threadId }, "mutate");
+      await requireParentPlan(planId, ctx.threadId, ctx.projectId, "mutate");
       const nodes = nodesOf(planId);
       const target = nodeId
         ? lookupPlanNode(planId, nodeId)
@@ -2717,16 +2791,16 @@ export default async function plugin(bb: BbPluginApi) {
         completed: "Completed harness node",
       },
     },
-    parameters: completeNodeInputSchema,
+    parameters: completeNodeInputSchema.omit({ threadId: true }),
     async execute(input, ctx) {
-      requirePlanAccess(input.planId, {
-        projectId: ctx.projectId ?? input.projectId,
-        threadId: ctx.threadId ?? input.threadId,
-      }, "mutate");
-      const completed = await completePlanNode(input, {
-        actor: "parent-agent",
-        source: "harness_complete_node",
-      });
+      if (!ctx.threadId) {
+        return "Invoke this tool from the parent thread that owns the plan.";
+      }
+      await requireParentPlan(input.planId, ctx.threadId, ctx.projectId, "mutate");
+      const completed = await completePlanNode(
+        { ...input, threadId: ctx.threadId },
+        { actor: "parent-agent", source: "harness_complete_node" },
+      );
       const plan = await toFull(requirePlan(input.planId));
       const next = nextWorkNode(plan.nodes);
       return JSON.stringify({ completed: completed.id, next, plan }, null, 2);
@@ -2737,7 +2811,7 @@ export default async function plugin(bb: BbPluginApi) {
     const child = selectNodeByChild.get(threadId) as NodeRow | undefined;
     if (!child) return null;
     const node = toNode(child);
-    if (node.status !== "in_progress") return null;
+    if (node.status !== "in_progress" && node.status !== "starting") return null;
     const plan = selectPlan.get(child.plan_id) as PlanRow | undefined;
     if (!plan?.thread_id || !readArc(plan.thread_id)) return null;
     return node;
