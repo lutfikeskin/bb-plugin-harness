@@ -35,28 +35,28 @@ export const ROUTING_SLOT_COPY: Record<
   { label: string; hint: string }
 > = {
   explore: {
-    label: "Explore / Scout",
-    hint: "Explore stays on the parent for Standard Harness. Milestone Scout/Specialist spawn children. Unset inherits the parent thread.",
+    label: "Explore",
+    hint: "Explore stays on the parent for Standard Harness unless a custom definition sets child execution. Unset inherits the parent thread.",
   },
   plan: {
-    label: "Plan / Planner",
-    hint: "Plan stays on the parent for Standard Harness. Milestone Planner submits a packet for operator approval.",
+    label: "Plan",
+    hint: "Plan stays on the parent for Standard Harness unless a custom definition sets child execution.",
   },
   workerFirst: {
     label: "Worker (first node)",
-    hint: "First Worker child. On Milestone Pipeline this is Worker + Tester. Prewalk frontier.",
+    hint: "First Worker child. Prewalk frontier.",
   },
   workerRest: {
     label: "Worker (later nodes)",
-    hint: "Later Worker children, including Milestone's one-shot correction. Prewalk commodity.",
+    hint: "Later Worker children. Prewalk commodity.",
   },
   critic: {
-    label: "Critic / Reviewer",
-    hint: "Critic may rewind Worker. Milestone Reviewer returns APPROVE, CORRECTION_REQUIRED, or BLOCKED.",
+    label: "Critic",
+    hint: "Critic may rewind Worker with APPROVE, REWORK, or BLOCK.",
   },
   promote: {
     label: "Promote",
-    hint: "The job is unfinished until you communicate it. Spawns a child on Standard and Milestone.",
+    hint: "The job is unfinished until you communicate it. Spawns a child on Standard Harness.",
   },
 };
 
@@ -101,13 +101,30 @@ export function routingSlotFor(phase: Phase, workerIndex: number): RoutingSlot {
   return "workerRest";
 }
 
-export function isSpawnablePhase(phase: Phase): boolean {
-  return phase === "worker" || phase === "critic" || phase === "promote";
+export const EXECUTION_MODES = ["parent", "child"] as const;
+export type ExecutionMode = (typeof EXECUTION_MODES)[number];
+
+export function isExecutionMode(value: string): value is ExecutionMode {
+  return (EXECUTION_MODES as readonly string[]).includes(value);
 }
 
-/** Every executable Harness run node, including Scout and Planner, is a visible child. */
-export function isRunRoleSpawnable(_phase: Phase): boolean {
-  return true;
+export const DEFAULT_EXECUTION: Record<Phase, ExecutionMode> = {
+  explore: "parent",
+  plan: "parent",
+  worker: "child",
+  critic: "child",
+  promote: "child",
+};
+
+export function isSpawnablePhase(phase: Phase): boolean {
+  return DEFAULT_EXECUTION[phase] === "child";
+}
+
+export function nodeSpawnsChild(node: {
+  phase: Phase;
+  execution?: ExecutionMode;
+}): boolean {
+  return (node.execution ?? DEFAULT_EXECUTION[node.phase]) === "child";
 }
 
 export const PHASE_COPY: Record<
@@ -234,6 +251,8 @@ export type PlanNode = {
   model?: string | null;
   reasoningLevel?: string | null;
   serviceTier?: string | null;
+  execution?: ExecutionMode;
+  skills?: string[];
 };
 
 export function nodeChoice(node: PlanNode): ExecutionChoice | null {
@@ -382,28 +401,40 @@ export function namespacedNodeId(
 export type PhaseSpec = {
   title: string;
   detail: string;
+  execution: ExecutionMode;
+  skills: string[];
 };
 
 export const DEFAULT_PHASE_SPECS: Record<Phase, PhaseSpec> = {
   explore: {
     title: "Explore the problem",
     detail: "Read the system. Isolate the real constraint. Do not implement yet.",
+    execution: "parent",
+    skills: [],
   },
   plan: {
     title: "Write the DAG",
     detail: "Name each node and its dependencies. One node, one outcome.",
+    execution: "parent",
+    skills: [],
   },
   worker: {
     title: "Implement the next node",
     detail: "Do one DAG node. Keep auditable output in artifacts/.",
+    execution: "child",
+    skills: [],
   },
   critic: {
     title: "Critique and simplify",
-    detail: "Question what shipped. Send work back if it does not hold.",
+    detail: "Return APPROVE, REWORK, or BLOCK. Send work back if it does not hold.",
+    execution: "child",
+    skills: [],
   },
   promote: {
     title: "Promote the result",
     detail: "Tell the people who need to know. A silent ship is unfinished.",
+    execution: "child",
+    skills: [],
   },
 };
 
@@ -423,6 +454,8 @@ export function seedArcNodes(
       title: spec.title,
       detail: spec.detail,
       phase,
+      execution: spec.execution ?? DEFAULT_EXECUTION[phase],
+      skills: [...(spec.skills ?? [])],
       deps: previous ? [seedNodeId(planId, previous)] : [],
     };
   });

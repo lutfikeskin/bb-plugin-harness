@@ -46,7 +46,7 @@ export default definePluginApp((app) => {
     id: "routing",
     title: "Role routing",
     description:
-      "Provider and model for each Harness role. Standard Harness keeps Explore/Plan on the parent and spawns Worker/Critic/Promote children. Milestone Pipeline spawns a visible child per run node. v1 Milestone runs one Worker + Tester after plan approval.",
+      "Provider and model for each Harness role. Standard Harness keeps Explore/Plan on the parent and spawns Worker/Critic/Promote children. Custom Harnesses may change execution per phase.",
     component: HarnessSettings,
   });
 

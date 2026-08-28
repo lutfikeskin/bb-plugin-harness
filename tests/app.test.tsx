@@ -10,7 +10,6 @@ import {
 import type { HarnessStatusDto } from "../server";
 import { emptyRoleRouting } from "../lib/harness";
 import { STANDARD_HARNESS_ID } from "../lib/definitions";
-import { MILESTONE_PIPELINE_ID } from "../lib/run-engine";
 
 let app: CapturedPluginApp;
 
@@ -29,98 +28,65 @@ const emptyStatus = (threadId = "thr_1"): HarnessStatusDto => ({
   frontierModel: "dear",
   prewalkEnabled: true,
   routing: emptyRoleRouting(),
-  run: null,
   harness: null,
   customHarnesses: [],
 });
 
-function runNode(
-  extra: Partial<NonNullable<HarnessStatusDto["run"]>["nodes"][number]> & {
-    id: string;
-    role: NonNullable<HarnessStatusDto["run"]>["nodes"][number]["role"];
-  },
-): NonNullable<HarnessStatusDto["run"]>["nodes"][number] {
-  return {
-    runId: "run_1",
-    templateNodeKey: extra.role,
-    phase: "explore",
-    ordinal: 0,
-    status: "pending",
-    deps: [],
-    childThreadId: null,
-    providerId: null,
-    model: null,
-    reasoningLevel: null,
-    serviceTier: null,
-    startedAt: null,
-    completedAt: null,
-    packetVersion: 0,
-    child: null,
-    ...extra,
-  };
-}
-
-function runStatus(args: {
-  status: NonNullable<HarnessStatusDto["run"]>["status"];
-  controls?: Partial<NonNullable<HarnessStatusDto["run"]>["controls"]>;
-  nodes?: NonNullable<HarnessStatusDto["run"]>["nodes"];
-  packets?: NonNullable<HarnessStatusDto["run"]>["packets"];
-}): HarnessStatusDto {
-  const nodes =
-    args.nodes ??
-    [
-      runNode({
-        id: "node_scout",
-        role: "scout",
-        status: "in_progress",
-        childThreadId: "thr_child",
-        child: {
-          id: "thr_child",
-          title: "Scout",
-          status: "active",
-          providerId: "pi",
-        },
-      }),
-    ];
-  const currentNode = nodes.find((node) => node.status === "in_progress") ?? null;
+function activeStatus(): HarnessStatusDto {
+  const planId = "plan_std";
   return {
     ...emptyStatus(),
-    arc: { ...emptyStatus().arc, phase: currentNode?.phase ?? "explore" },
-    run: {
-      id: "run_1",
+    harness: {
+      id: STANDARD_HARNESS_ID,
+      name: "Standard Harness",
+      description: "default",
+      kind: "builtin",
+      engine: "manual",
+    },
+    arc: {
+      threadId: "thr_1",
       projectId: "proj_1",
-      parentThreadId: "thr_1",
-      templateId: MILESTONE_PIPELINE_ID,
-      status: args.status,
-      currentStageId: currentNode?.id ?? null,
-      taskPacket: {
-        objective: "Ship the UI",
-        branch: null,
-        execPlanPath: null,
-        protectedPaths: [],
-        runScout: true,
-        specialistQuestion: null,
-        routingOverrides: null,
-        projectId: "proj_1",
-        parentThreadId: "thr_1",
-        environmentId: "env_1",
-        promptVersion: "harness-role-prompts@1",
-        schemaVersion: "harness-packets@1",
-      },
-      correctionCount: 0,
+      phase: "explore",
+      note: "Ship it",
+      updatedAt: 2,
+    },
+    plan: {
+      id: planId,
+      projectId: "proj_1",
+      threadId: "thr_1",
+      name: "Ship it",
       createdAt: 1,
       updatedAt: 1,
-      completedAt: null,
-      nodes,
-      packets: args.packets ?? [],
-      currentNode,
-      controls: {
-        canApprovePlan: false,
-        canApproveCorrection: false,
-        canStop: args.status === "running" || args.status.startsWith("awaiting"),
-        canRetry: false,
-        ...args.controls,
+      nodeCount: 5,
+      doneCount: 0,
+      harnessId: STANDARD_HARNESS_ID,
+      correctionCount: 0,
+      criticBlocked: false,
+      harnessSnapshot: null,
+      totals: {
+        durationMs: 12,
+        tokens: { input: 3, cached: 0, output: 1, reasoning: 0, total: 4 },
       },
+      skillWarnings: [],
+      nodes: ["explore", "plan", "worker", "critic", "promote"].map((phase, index) => ({
+        id: `${planId}-${phase}`,
+        title: phase,
+        detail: "",
+        phase: phase as HarnessStatusDto["arc"]["phase"],
+        status: phase === "explore" ? "in_progress" : "pending",
+        deps: [],
+        sortOrder: index,
+        childThreadId: null,
+        providerId: null,
+        model: null,
+        reasoningLevel: null,
+        serviceTier: null,
+        execution: phase === "explore" || phase === "plan" ? "parent" : "child",
+        skills: [],
+        child: null,
+        result: null,
+        attempt: null,
+      })),
     },
   };
 }
@@ -128,7 +94,6 @@ function runStatus(args: {
 beforeAll(async () => {
   app = await loadPluginApp(() => import("../app"));
 });
-
 afterEach(() => {
   cleanup();
 });
@@ -155,80 +120,36 @@ describe("Harness UI activation", () => {
     expect(await slot.findByText("Harness is inactive")).toBeTruthy();
     const start = slot.getByRole("button", { name: "Start Harness" });
     expect((start as HTMLButtonElement).disabled).toBe(true);
-    expect(
-      slot.inspection.rpcCalls.every((call) => call.method === "getStatus"),
-    ).toBe(true);
+    expect(slot.inspection.rpcCalls.every((call) => call.method === "getStatus")).toBe(true);
     slot.lifecycle.unmount();
   });
 
-  it("disables Start without a task and submits the Task Packet when started", async () => {
-    let active = false;
+  it("starts Standard Harness by default without Milestone fields", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
         rpc: {
-          getStatus: () => (active ? runStatus({ status: "running" }) : emptyStatus()),
-          startRun: (input) => {
-            active = true;
-            return runStatus({ status: "running" });
-          },
+          getStatus: () => emptyStatus(),
+          startRun: () => emptyStatus(),
         },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
     await slot.findByText("Harness is inactive");
-    expect(slot.getByLabelText("Harness")).toBeTruthy();
-    expect((slot.getByLabelText("Harness") as HTMLSelectElement).value).toBe(
-      STANDARD_HARNESS_ID,
-    );
     expect(slot.queryByLabelText("Run Scout")).toBeNull();
-    const start = slot.getByRole("button", { name: "Start Harness" });
-    expect((start as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(start);
-    expect(
-      slot.inspection.rpcCalls.some((call) => call.method === "startRun"),
-    ).toBe(false);
-
-    fireEvent.change(slot.getByLabelText("Harness"), {
-      target: { value: MILESTONE_PIPELINE_ID },
-    });
-    expect(slot.getByLabelText("Run Scout")).toBeTruthy();
+    expect(slot.queryByText("Milestone")).toBeNull();
     fireEvent.change(slot.getByLabelText("Task"), {
-      target: { value: "Implement UI activation" },
+      target: { value: "Ship Standard Harness" },
     });
-    fireEvent.click(slot.getByText("Optional fields"));
-    fireEvent.change(slot.getByLabelText("ExecPlan path"), {
-      target: { value: "plans/opt-in-harness-orchestration-plan.md" },
-    });
-    fireEvent.change(slot.getByLabelText("Branch"), {
-      target: { value: "pipeline-migration" },
-    });
-    fireEvent.change(slot.getByLabelText("Protected paths"), {
-      target: { value: "secrets.env, core/legacy" },
-    });
-    fireEvent.click(slot.getByLabelText("Run Scout"));
     fireEvent.click(slot.getByRole("button", { name: "Start Harness" }));
-
     await waitFor(() => {
-      expect(
-        slot.inspection.rpcCalls.some((call) => call.method === "startRun"),
-      ).toBe(true);
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "startRun")).toBe(true);
     });
-    const startCall = slot.inspection.rpcCalls.find(
-      (call) => call.method === "startRun",
-    );
-    expect(startCall?.input).toMatchObject({
-      threadId: "thr_1",
-      projectId: "proj_1",
-      objective: "Implement UI activation",
-      harnessId: MILESTONE_PIPELINE_ID,
-      runScout: false,
-      execPlanPath: "plans/opt-in-harness-orchestration-plan.md",
-      branch: "pipeline-migration",
-      protectedPaths: ["secrets.env", "core/legacy"],
+    expect(slot.inspection.rpcCalls.find((call) => call.method === "startRun")?.input).toMatchObject({
+      harnessId: STANDARD_HARNESS_ID,
+      objective: "Ship Standard Harness",
     });
-    expect(await slot.findByText("Current stage:")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 
@@ -243,95 +164,10 @@ describe("Harness UI activation", () => {
       },
     );
     await waitFor(() => {
-      expect(slot.inspection.rpcCalls.some((call) => call.method === "getStatus")).toBe(
-        true,
-      );
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "getStatus")).toBe(true);
     });
     expect(slot.queryByText(/Harness ·/)).toBeNull();
-    expect(
-      slot.inspection.rpcCalls.every((call) => call.method === "getStatus"),
-    ).toBe(true);
     slot.lifecycle.unmount();
-  });
-
-  it("shows the current stage and a child Open action on an active run", async () => {
-    const slot = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: { getStatus: () => runStatus({ status: "running" }) },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    expect(await slot.findByText("Current stage:")).toBeTruthy();
-    expect(slot.getAllByText("Scout").length).toBeGreaterThan(0);
-    fireEvent.click(slot.getByRole("button", { name: "Open" }));
-    expect(slot.inspection.navigateCalls).toContainEqual({
-      method: "toThread",
-      threadId: "thr_child",
-    });
-    expect(slot.queryByRole("button", { name: "Approve Plan" })).toBeNull();
-    expect(slot.queryByRole("button", { name: "Run Correction" })).toBeNull();
-    expect(slot.getByRole("button", { name: "Stop" })).toBeTruthy();
-    slot.lifecycle.unmount();
-  });
-
-  it("shows plan approval, correction, retry, and stop only in valid states", async () => {
-    const plan = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: {
-          getStatus: () =>
-            runStatus({
-              status: "awaiting_plan_approval",
-              controls: { canApprovePlan: true, canStop: true },
-            }),
-        },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    expect(await plan.findByRole("button", { name: "Approve Plan" })).toBeTruthy();
-    expect(plan.queryByRole("button", { name: "Run Correction" })).toBeNull();
-    expect(plan.queryByRole("button", { name: "Retry" })).toBeNull();
-    plan.lifecycle.unmount();
-
-    const correction = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: {
-          getStatus: () =>
-            runStatus({
-              status: "awaiting_correction_approval",
-              controls: { canApproveCorrection: true, canStop: true },
-            }),
-        },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    expect(
-      await correction.findByRole("button", { name: "Run Correction" }),
-    ).toBeTruthy();
-    expect(correction.queryByRole("button", { name: "Approve Plan" })).toBeNull();
-    correction.lifecycle.unmount();
-
-    const retry = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: {
-          getStatus: () =>
-            runStatus({
-              status: "running",
-              controls: { canRetry: true, canStop: true },
-            }),
-        },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    expect(await retry.findByRole("button", { name: "Retry" })).toBeTruthy();
-    retry.lifecycle.unmount();
   });
 
   it("opens the Harness panel from the thread header action", async () => {
@@ -348,7 +184,7 @@ describe("Harness UI activation", () => {
     slot.lifecycle.unmount();
   });
 
-  it("labels settings with agent roles", async () => {
+  it("labels settings with Standard role names", async () => {
     const slot = renderSlot(
       app.settingsSections[0]!,
       {},
@@ -356,10 +192,11 @@ describe("Harness UI activation", () => {
         rpc: { getRouting: () => ({ routing: emptyRoleRouting() }) },
       },
     );
-    expect(await slot.findByText("Explore / Scout")).toBeTruthy();
-    expect(slot.getByText("Plan / Planner")).toBeTruthy();
+    expect(await slot.findByText("Explore")).toBeTruthy();
+    expect(slot.getByText("Plan")).toBeTruthy();
     expect(slot.getByText("Worker (first node)")).toBeTruthy();
-    expect(slot.getByText("Critic / Reviewer")).toBeTruthy();
+    expect(slot.getByText("Critic")).toBeTruthy();
+    expect(slot.queryByText("Explore / Scout")).toBeNull();
     slot.lifecycle.unmount();
   });
 
@@ -374,14 +211,11 @@ describe("Harness UI activation", () => {
       },
     );
     await slot.findByText("Harness is inactive");
-    const before = slot.inspection.rpcCalls.filter(
-      (call) => call.method === "getStatus",
-    ).length;
+    const before = slot.inspection.rpcCalls.filter((call) => call.method === "getStatus").length;
     await slot.behavior.setRealtimeConnectionState("connected");
     await waitFor(() => {
       expect(
-        slot.inspection.rpcCalls.filter((call) => call.method === "getStatus")
-          .length,
+        slot.inspection.rpcCalls.filter((call) => call.method === "getStatus").length,
       ).toBeGreaterThan(before);
     });
     slot.lifecycle.unmount();
@@ -407,58 +241,20 @@ describe("Harness UI activation", () => {
       {
         rpc: {
           getStatus: ({ threadId }: { threadId: string }) =>
-            threadId === "thr_1"
-              ? runStatus({ status: "running", controls: { canStop: true } })
-              : new Promise<HarnessStatusDto>(() => {}),
+            threadId === "thr_1" ? activeStatus() : new Promise<HarnessStatusDto>(() => {}),
         },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
-    expect(await slot.findByText("Current stage:")).toBeTruthy();
-    expect(slot.getByRole("button", { name: "Stop" })).toBeTruthy();
+    expect(await slot.findByRole("button", { name: "Stop" })).toBeTruthy();
     expect(slot.getByText(/Harness · Explore/)).toBeTruthy();
     act(() => {
       setThreadId("thr_ordinary");
     });
     expect(slot.queryByRole("button", { name: "Stop" })).toBeNull();
-    expect(slot.queryByText("Current stage:")).toBeNull();
     expect(slot.queryByText(/Harness · Explore/)).toBeNull();
     expect(slot.getByText("Loading harness…")).toBeTruthy();
-    expect(
-      slot.inspection.rpcCalls.some((call) => call.method === "stopRun"),
-    ).toBe(false);
-    slot.lifecycle.unmount();
-  });
-
-  it("starts Standard Harness by default without Milestone fields", async () => {
-    const slot = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: {
-          getStatus: () => emptyStatus(),
-          startRun: () => emptyStatus(),
-        },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    await slot.findByText("Harness is inactive");
-    expect(slot.queryByText("Template")).toBeNull();
-    fireEvent.change(slot.getByLabelText("Task"), {
-      target: { value: "Ship Standard Harness" },
-    });
-    fireEvent.click(slot.getByRole("button", { name: "Start Harness" }));
-    await waitFor(() => {
-      expect(
-        slot.inspection.rpcCalls.some((call) => call.method === "startRun"),
-      ).toBe(true);
-    });
-    expect(
-      slot.inspection.rpcCalls.find((call) => call.method === "startRun")?.input,
-    ).toMatchObject({
-      harnessId: STANDARD_HARNESS_ID,
-      objective: "Ship Standard Harness",
-    });
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "stopRun")).toBe(false);
     slot.lifecycle.unmount();
   });
 
@@ -476,12 +272,16 @@ describe("Harness UI activation", () => {
               description: "custom",
               kind: "custom",
               engine: "manual",
+              schemaVersion: 2 as const,
+              artifactPolicy: "advisory" as const,
+              promoteMode: "always" as const,
+              maxCorrections: null,
               phases: {
-                explore: { title: "e", detail: "d" },
-                plan: { title: "p", detail: "d" },
-                worker: { title: "w", detail: "d" },
-                critic: { title: "c", detail: "d" },
-                promote: { title: "pr", detail: "d" },
+                explore: { title: "e", detail: "d", execution: "parent" as const, skills: [] },
+                plan: { title: "p", detail: "d", execution: "parent" as const, skills: [] },
+                worker: { title: "w", detail: "d", execution: "child" as const, skills: [] },
+                critic: { title: "c", detail: "d", execution: "child" as const, skills: [] },
+                promote: { title: "pr", detail: "d", execution: "child" as const, skills: [] },
               },
               createdAt: 1,
               updatedAt: 1,
@@ -498,9 +298,7 @@ describe("Harness UI activation", () => {
     });
     fireEvent.click(slot.getByRole("button", { name: "Save Harness" }));
     await waitFor(() => {
-      expect(
-        slot.inspection.rpcCalls.some((call) => call.method === "createHarness"),
-      ).toBe(true);
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "createHarness")).toBe(true);
     });
     slot.lifecycle.unmount();
   });
@@ -526,59 +324,12 @@ describe("Harness UI activation", () => {
     slot.lifecycle.unmount();
   });
 
-  it("renders manual arc controls, DAG Start/Done, and Add Worker", async () => {
-    const planId = "plan_std";
-    const status: HarnessStatusDto = {
-      ...emptyStatus(),
-      harness: {
-        id: STANDARD_HARNESS_ID,
-        name: "Standard Harness",
-        description: "default",
-        kind: "builtin",
-        engine: "manual",
-      },
-      arc: {
-        threadId: "thr_1",
-        projectId: "proj_1",
-        phase: "explore",
-        note: "Ship it",
-        updatedAt: 2,
-      },
-      plan: {
-        id: planId,
-        projectId: "proj_1",
-        threadId: "thr_1",
-        name: "Ship it",
-        createdAt: 1,
-        updatedAt: 1,
-        nodeCount: 5,
-        doneCount: 0,
-        harnessId: STANDARD_HARNESS_ID,
-        harnessSnapshot: null,
-        nodes: ["explore", "plan", "worker", "critic", "promote"].map(
-          (phase, index) => ({
-            id: `${planId}-${phase}`,
-            title: phase,
-            detail: "",
-            phase: phase as HarnessStatusDto["arc"]["phase"],
-            status: phase === "explore" ? "in_progress" : "pending",
-            deps: [],
-            sortOrder: index,
-            childThreadId: null,
-            providerId: null,
-            model: null,
-            reasoningLevel: null,
-            serviceTier: null,
-            child: null,
-          }),
-        ),
-      },
-    };
+  it("renders manual arc controls, DAG Start/Done, totals, and Add Worker", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
-        rpc: { getStatus: () => status },
+        rpc: { getStatus: () => activeStatus() },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
@@ -588,7 +339,9 @@ describe("Harness UI activation", () => {
     expect(slot.getByRole("button", { name: "Done" })).toBeTruthy();
     expect(slot.getAllByRole("button", { name: "Start" }).length).toBeGreaterThan(0);
     expect(slot.getByRole("button", { name: "Add Worker" })).toBeTruthy();
+    expect(slot.getByText(/tokens 4/)).toBeTruthy();
     expect(slot.queryByText("Harness is inactive")).toBeNull();
+    expect(slot.queryByText("Current stage:")).toBeNull();
     slot.lifecycle.unmount();
   });
 });

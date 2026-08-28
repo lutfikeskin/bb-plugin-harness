@@ -126,8 +126,8 @@ export function HarnessSettings() {
       <p className="text-sm text-muted-foreground">
         Pick a real provider and model for each role. Standard Harness: Explore
         and Plan inherit on the parent; Worker, Critic, and Promote spawn
-        children. Milestone Pipeline: every run node spawns a visible child.
-        Leave a slot unset to inherit the parent thread.
+        children unless a custom definition changes execution. Leave a slot
+        unset to inherit the parent thread.
       </p>
       {ROUTING_SLOTS.map((slot) => (
         <div key={slot} className="space-y-1.5 border-b border-border pb-3 last:border-0">

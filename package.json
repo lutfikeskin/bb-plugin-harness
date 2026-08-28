@@ -12,7 +12,7 @@
   },
   "bb": {
     "name": "Harness",
-    "description": "Opt-in coding harness. Standard Harness is the default (Explore → Plan → Worker → Critic → Promote). Milestone Pipeline is optional. Create custom Harnesses from Standard.",
+    "description": "Opt-in coding harness. Standard Harness is the immutable default (Explore → Plan → Worker → Critic → Promote). Create custom Harnesses from Standard.",
     "branding": {
       "icon": "./assets/icon.svg"
     },
