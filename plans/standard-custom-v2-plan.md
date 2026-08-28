@@ -71,7 +71,7 @@ Extend definitions additively:
 - REWORK/stop/skip stop live children before DB authority changes.
 - Historical Milestone rows are settled on Start and never block Standard. Legacy `--milestone` errors.
 - Custom policies keep execution, artifacts, and maxCorrections. Phase skill fields and `promoteMode: ask` are ignored; only `always`/`off` remain.
-- Start claims the arc with a conditional insert. Artifact refs stay under `artifacts/`.
+- Start claims the arc with a conditional insert and binds `arcs.plan_id`. Artifact refs stay under `artifacts/`.
 - Plugin RPC is full-trust local UI/CLI, not a tenant auth boundary. Plan RPCs require the owning parent thread from `threads.get`.
 - Child spawn claims pending→starting before any await. Routing is resolved before spawn; attach is a sync CAS. Start/Stop/Skip serialize per parent thread. Failed-child reconcile is CAS on status+child id.
 - Inherited attempt model uses `threads.defaultExecutionOptions` when present; otherwise `inherited-unknown` with null provider/model.

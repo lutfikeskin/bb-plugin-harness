@@ -443,6 +443,7 @@ type ArcRow = {
   note: string;
   updated_at: number;
   harness_id: string | null;
+  plan_id: string | null;
 };
 
 type PlanRow = {
@@ -718,7 +719,13 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE INDEX IF NOT EXISTS plan_node_attempts_node_idx
        ON plan_node_attempts(plan_id, node_id, created_at)`,
     `CREATE INDEX IF NOT EXISTS plan_node_attempts_child_idx ON plan_node_attempts(child_thread_id)`,
+    `ALTER TABLE arcs ADD COLUMN plan_id TEXT`,
   ]);
+  // Append-only migrate can skip a shifted ALTER; add the column if it is still missing.
+  const arcColumns = db.prepare("PRAGMA table_info(arcs)").all() as Array<{ name: string }>;
+  if (!arcColumns.some((column) => column.name === "plan_id")) {
+    db.exec("ALTER TABLE arcs ADD COLUMN plan_id TEXT");
+  }
 
   const settings = bb.settings.define({
     frontierModel: {
@@ -744,18 +751,21 @@ export default async function plugin(bb: BbPluginApi) {
 
   const selectArc = db.prepare("SELECT * FROM arcs WHERE thread_id = ?");
   const insertArc = db.prepare(
-    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id)
-     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id)`,
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id, @plan_id)`,
   );
   const upsertArc = db.prepare(
-    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id)
-     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id)
+    `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+     VALUES (@thread_id, @project_id, @phase, @note, @updated_at, @harness_id, @plan_id)
      ON CONFLICT(thread_id) DO UPDATE SET
        project_id = excluded.project_id,
        phase = excluded.phase,
        note = excluded.note,
        updated_at = excluded.updated_at,
        harness_id = excluded.harness_id`,
+  );
+  const bindArcPlanId = db.prepare(
+    `UPDATE arcs SET plan_id = ? WHERE thread_id = ? AND plan_id IS NULL`,
   );
   const deleteArc = db.prepare("DELETE FROM arcs WHERE thread_id = ?");
   const selectPlan = db.prepare("SELECT * FROM plans WHERE id = ?");
@@ -1113,11 +1123,31 @@ export default async function plugin(bb: BbPluginApi) {
     throw new Error("This plan does not belong to this project or thread.");
   }
 
-  function planForThread(projectId: string, threadId: string): PlanRow | null {
-    return (
-      (selectPlansForThread.get(projectId, threadId) as PlanRow | undefined) ??
-      null
+  function activePlanForArc(arc: ArcRow): PlanRow | null {
+    if (arc.plan_id) {
+      const bound = selectPlan.get(arc.plan_id) as PlanRow | undefined;
+      if (
+        bound &&
+        bound.thread_id === arc.thread_id &&
+        bound.project_id === arc.project_id
+      ) {
+        return bound;
+      }
+      return null;
+    }
+    const rows = selectPlansForThread.all(arc.project_id, arc.thread_id) as PlanRow[];
+    if (rows.length === 1) {
+      const only = rows[0]!;
+      bindArcPlanId.run(only.id, arc.thread_id);
+      arc.plan_id = only.id;
+      return only;
+    }
+    const live = rows.filter((row) =>
+      nodesOf(row.id).some(
+        (node) => node.status === "in_progress" || node.status === "starting",
+      ),
     );
+    return live.length === 1 ? live[0]! : null;
   }
 
   async function resolveProjectId(
@@ -1177,6 +1207,7 @@ export default async function plugin(bb: BbPluginApi) {
       note,
       updated_at: Date.now(),
       harness_id: harnessId ?? existing?.harness_id ?? STANDARD_HARNESS_ID,
+      plan_id: existing?.plan_id ?? null,
     };
     upsertArc.run(row);
     publish();
@@ -1221,7 +1252,7 @@ export default async function plugin(bb: BbPluginApi) {
           note: "",
           updatedAt: 0,
         };
-    const planRow = existingArc ? planForThread(projectId, ownerId) : null;
+    const planRow = existingArc ? activePlanForArc(existingArc) : null;
     const plan = planRow ? await toFull(planRow) : null;
     const snapshot = planRow ? snapshotOf(planRow) : null;
     const harnessId = existingArc?.harness_id ?? snapshot?.id ?? null;
@@ -1460,7 +1491,7 @@ export default async function plugin(bb: BbPluginApi) {
     if (!arc) {
       throw new Error("No active Harness run on this thread.");
     }
-    const current = planForThread(arc.project_id, threadId);
+    const current = activePlanForArc(arc);
     if (!current || current.id !== plan.id) {
       throw new Error("This plan is not the active Harness run on this thread.");
     }
@@ -1910,7 +1941,14 @@ export default async function plugin(bb: BbPluginApi) {
   async function skipPlanNode(planId: string, nodeId: string): Promise<PlanNode> {
     const ownerId = requirePlan(planId).thread_id;
     const skip = async () => {
+      const plan = requirePlan(planId);
       const node = lookupPlanNode(planId, nodeId);
+      if (
+        (node.status === "starting" || node.status === "in_progress") &&
+        plan.thread_id
+      ) {
+        assertActiveHarnessPlan(plan, plan.thread_id);
+      }
       if (node.status === "starting") {
         throw new Error(
           `Cannot skip ${node.id} while it is starting. Retry after the child is attached.`,
@@ -2122,6 +2160,7 @@ export default async function plugin(bb: BbPluginApi) {
         note: input.objective.trim(),
         updated_at: now,
         harness_id: frozen.id,
+        plan_id: planId,
       });
       insertPlan.run(row);
       insertSeedNodes(row.id, frozen);
@@ -2175,7 +2214,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (arc.project_id !== projectId) {
         throw new Error(`projectId ${arc.project_id} does not match thread ${threadId}.`);
       }
-      const plan = planForThread(arc.project_id, threadId);
+      const plan = activePlanForArc(arc);
       if (plan) {
         const live = nodesOf(plan.id);
         await stopLiveChildren(live, "stop Harness");
@@ -2236,7 +2275,7 @@ export default async function plugin(bb: BbPluginApi) {
       const prev = previousPhase(phase);
       if (!prev) throw new Error("Already at Explore.");
       if (phase === "critic" && prev === "worker") {
-        const plan = planForThread(resolved, threadId);
+        const plan = activePlanForArc(arc);
         if (plan) await reopenLastWorker(plan.id);
       }
       writeArc(threadId, resolved, prev);
@@ -2517,7 +2556,7 @@ export default async function plugin(bb: BbPluginApi) {
             const prev = previousPhase(phase);
             if (!prev) return fail("Already at Explore.");
             if (phase === "critic" && prev === "worker") {
-              const plan = planForThread(projectId, threadId!);
+              const plan = activePlanForArc(arc);
               if (plan) await reopenLastWorker(plan.id);
             }
             writeArc(threadId!, projectId, prev);
@@ -2877,7 +2916,11 @@ export default async function plugin(bb: BbPluginApi) {
     const node = toNode(child);
     if (node.status !== "in_progress" && node.status !== "starting") return null;
     const plan = selectPlan.get(child.plan_id) as PlanRow | undefined;
-    if (!plan?.thread_id || !readArc(plan.thread_id)) return null;
+    if (!plan?.thread_id) return null;
+    const arc = readArc(plan.thread_id);
+    if (!arc) return null;
+    const active = activePlanForArc(arc);
+    if (!active || active.id !== plan.id) return null;
     return node;
   }
 
@@ -2886,7 +2929,7 @@ export default async function plugin(bb: BbPluginApi) {
     const arc = readArc(owner);
     if (!arc) return null;
     const phase = isPhase(arc.phase) ? arc.phase : "explore";
-    const plan = planForThread(arc.project_id, owner);
+    const plan = activePlanForArc(arc);
     if (plan) {
       const inflight = activeNode(nodesOf(plan.id));
       if (inflight && !nodeSpawnsChild(inflight)) {

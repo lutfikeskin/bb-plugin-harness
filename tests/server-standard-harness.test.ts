@@ -1338,6 +1338,189 @@ describe("standard and custom harnesses", () => {
     expect(status.harness).toBeNull();
   });
 
+  it("keeps status and Stop on plan A after creating plan B on the same thread", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const planId = await startThroughPlan(host);
+    const live = (await host.harness.behavior.callRpc("startNode", {
+      planId,
+      nodeId: "worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { nodes: Array<{ phase: string; childThreadId: string | null }> } };
+    const childId = live.plan.nodes.find((node) => node.phase === "worker")!.childThreadId!;
+    const created = (await host.harness.behavior.callRpc("createPlan", {
+      projectId: PROJECT,
+      threadId: PARENT,
+      name: "Detached B",
+    })) as { plan: { id: string } };
+    expect(created.plan.id).not.toBe(planId);
+    await host.harness.behavior.callRpc("addNode", {
+      planId: created.plan.id,
+      title: "Extra worker",
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    const listed = (await host.harness.behavior.callRpc("listPlans", {
+      projectId: PROJECT,
+      threadId: PARENT,
+    })) as { plans: Array<{ id: string }> };
+    expect(listed.plans.map((plan) => plan.id)).toEqual(
+      expect.arrayContaining([planId, created.plan.id]),
+    );
+    const status = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as {
+      harness: { id: string } | null;
+      plan: { id: string; nodes: Array<{ phase: string; status: string; childThreadId: string | null }> } | null;
+    };
+    expect(status.harness?.id).toBe("standard");
+    expect(status.plan?.id).toBe(planId);
+    expect(status.plan?.nodes.find((node) => node.phase === "worker")).toMatchObject({
+      status: "in_progress",
+      childThreadId: childId,
+    });
+    const db = host.bb.storage.database();
+    expect(
+      (db.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string }).plan_id,
+    ).toBe(planId);
+    await host.harness.behavior.callRpc("stopRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toEqual([[{ threadId: childId }]]);
+    expect(
+      (db.prepare("SELECT COUNT(*) AS n FROM arcs WHERE thread_id = ?").get(PARENT) as { n: number }).n,
+    ).toBe(0);
+    const detached = (await host.harness.behavior.callRpc("getPlan", {
+      id: created.plan.id,
+      projectId: PROJECT,
+      threadId: PARENT,
+    })) as { plan: { id: string } | null };
+    expect(detached.plan?.id).toBe(created.plan.id);
+    const afterStop = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { harness: { id: string } | null };
+    expect(afterStop.harness).toBeNull();
+  });
+
+  it("migrates arcs.plan_id and resolves legacy null bindings conservatively", async () => {
+    host = await loadPlugin({ allowSpawn: true });
+    const db = host.bb.storage.database();
+    const columns = db.prepare("PRAGMA table_info(arcs)").all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "plan_id")).toBe(true);
+
+    const started = (await host.harness.behavior.callRpc("startRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+      objective: "Bound on start",
+    })) as { plan: { id: string } };
+    expect(
+      (db.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string }).plan_id,
+    ).toBe(started.plan.id);
+
+    await host.harness.lifecycle.dispose();
+    host = await loadPlugin({ allowSpawn: true });
+    const legacy = host.bb.storage.database();
+    legacy.prepare("DELETE FROM arcs").run();
+    legacy.prepare("DELETE FROM plan_node_attempts").run();
+    legacy.prepare("DELETE FROM plan_nodes").run();
+    legacy.prepare("DELETE FROM plans").run();
+    const now = Date.now();
+    legacy
+      .prepare(
+        `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at, harness_id, harness_snapshot, correction_count, critic_blocked)
+         VALUES (?, ?, ?, ?, ?, ?, 'standard', NULL, 0, 0)`,
+      )
+      .run("plan_only", PROJECT, PARENT, "Only plan", now, now);
+    legacy
+      .prepare(
+        `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+         VALUES (?, ?, 'explore', '', ?, 'standard', NULL)`,
+      )
+      .run(PARENT, PROJECT, now);
+    const bound = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { id: string } | null };
+    expect(bound.plan?.id).toBe("plan_only");
+    expect(
+      (legacy.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string | null })
+        .plan_id,
+    ).toBe("plan_only");
+
+    await host.harness.lifecycle.dispose();
+    host = await loadPlugin({ allowSpawn: true });
+    const ambiguous = host.bb.storage.database();
+    ambiguous.prepare("DELETE FROM arcs").run();
+    ambiguous.prepare("DELETE FROM plan_node_attempts").run();
+    ambiguous.prepare("DELETE FROM plan_nodes").run();
+    ambiguous.prepare("DELETE FROM plans").run();
+    const stamp = Date.now();
+    for (const row of [
+      { id: "plan_a", name: "A", updated: stamp, child: "thr_legacy_child" },
+      { id: "plan_b", name: "B", updated: stamp + 10, child: null as string | null },
+    ]) {
+      ambiguous
+        .prepare(
+          `INSERT INTO plans (id, project_id, thread_id, name, created_at, updated_at, harness_id, harness_snapshot, correction_count, critic_blocked)
+           VALUES (?, ?, ?, ?, ?, ?, 'standard', NULL, 0, 0)`,
+        )
+        .run(row.id, PROJECT, PARENT, row.name, stamp, row.updated);
+      for (const [index, phase] of ["explore", "plan", "worker", "critic", "promote"].entries()) {
+        ambiguous
+          .prepare(
+            `INSERT INTO plan_nodes (id, plan_id, title, detail, phase, status, deps, sort_order, child_thread_id, execution, skills)
+             VALUES (?, ?, ?, '', ?, ?, '[]', ?, ?, 'child', '[]')`,
+          )
+          .run(
+            `${row.id}-${phase}`,
+            row.id,
+            phase,
+            phase,
+            phase === "worker" && row.child ? "in_progress" : "pending",
+            index,
+            row.child && phase === "worker" ? row.child : null,
+          );
+      }
+    }
+    ambiguous
+      .prepare(
+        `INSERT INTO arcs (thread_id, project_id, phase, note, updated_at, harness_id, plan_id)
+         VALUES (?, ?, 'worker', '', ?, 'standard', NULL)`,
+      )
+      .run(PARENT, PROJECT, stamp);
+    host.threads.set(
+      "thr_legacy_child",
+      makeThreadResponse({
+        id: "thr_legacy_child",
+        projectId: PROJECT,
+        environmentId: ENV,
+        parentThreadId: PARENT,
+      }),
+    );
+    const kept = (await host.harness.behavior.callRpc("getStatus", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    })) as { plan: { id: string } | null };
+    expect(kept.plan?.id).toBe("plan_a");
+    expect(
+      (ambiguous.prepare("SELECT plan_id FROM arcs WHERE thread_id = ?").get(PARENT) as { plan_id: string | null })
+        .plan_id,
+    ).toBeNull();
+    await host.harness.behavior.callRpc("stopRun", {
+      threadId: PARENT,
+      projectId: PROJECT,
+    });
+    expect(host.harness.inspection.sdk.callsTo("threads.stop")).toEqual([
+      [{ threadId: "thr_legacy_child" }],
+    ]);
+    expect(
+      (ambiguous.prepare("SELECT COUNT(*) AS n FROM arcs").get() as { n: number }).n,
+    ).toBe(0);
+  });
+
   it("does not let a failed-child event overwrite a completed node", async () => {
     host = await loadPlugin({ allowSpawn: true });
     const started = (await host.harness.behavior.callRpc("startRun", {
