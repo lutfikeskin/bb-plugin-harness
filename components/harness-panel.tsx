@@ -17,8 +17,8 @@ import {
   type Phase,
 } from "../lib/harness";
 import { CRITIC_VERDICTS, type CriticVerdict } from "../lib/outcomes";
-import { SlotModelPicker } from "./harness-settings";
-import { StartHarnessForm } from "./start-harness-form";
+import { NodeRoutingControl } from "./harness-settings";
+import { HarnessV3Panel } from "./harness-v3-panel";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
@@ -182,34 +182,32 @@ function formatTokens(total: number | null | undefined): string {
   return total == null ? "—" : String(total);
 }
 
+function mutationRequestId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 function ManualHarnessView({
   status,
   pending,
-  onAdvance,
-  onRewind,
   onStop,
   onStartNode,
   onCompleteNode,
-  onReopenWorker,
   onAddWorker,
   onSetRouting,
   onResetBlock,
 }: {
   status: HarnessStatusDto;
   pending: boolean;
-  onAdvance: () => void;
-  onRewind: () => void;
   onStop: () => void;
   onStartNode: (nodeId: string) => void;
   onCompleteNode: (nodeId: string, extra?: { verdict?: CriticVerdict; summary?: string }) => void;
-  onReopenWorker: (nodeId: string) => void;
   onAddWorker: (title: string) => void;
   onSetRouting: (nodeId: string, choice: ExecutionChoice | null) => void;
   onResetBlock: () => void;
 }) {
   const navigate = useBbNavigate();
   const [workerTitle, setWorkerTitle] = useState("");
-  const [criticSummary, setCriticSummary] = useState("");
+  const [completionSummaries, setCompletionSummaries] = useState<Record<string, string>>({});
   const plan = status.plan;
   const phase = status.arc.phase;
   return (
@@ -227,6 +225,7 @@ function ManualHarnessView({
             ? ` / ${plan.harnessSnapshot.maxCorrections}`
             : ""}
           {plan.criticBlocked ? " · Promote blocked" : ""}
+          {` · ${plan.lifecycle} · rev ${plan.revision}`}
           {` · child ${plan.totals.durationMs ?? "—"}ms · tokens ${formatTokens(plan.totals.tokens.total)}`}
         </p>
       ) : null}
@@ -235,29 +234,13 @@ function ManualHarnessView({
           {warning}
         </p>
       ))}
+      {plan?.mutations?.[0] ? (
+        <p className="text-[11px] text-muted-foreground">
+          Last change: {plan.mutations[0].action} · {plan.mutations[0].source}
+          {plan.mutations[0].reason ? ` · ${plan.mutations[0].reason}` : ""}
+        </p>
+      ) : null}
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" disabled={pending} onClick={onAdvance}>
-          Advance
-        </Button>
-        <Button size="sm" variant="outline" disabled={pending} onClick={onRewind}>
-          Rewind
-        </Button>
-        {phase === "critic"
-          ? (plan?.nodes ?? [])
-              .filter((node) => node.phase === "worker" && node.status === "done")
-              .slice(-1)
-              .map((node) => (
-                <Button
-                  key={node.id}
-                  size="sm"
-                  variant="outline"
-                  disabled={pending}
-                  onClick={() => onReopenWorker(node.id)}
-                >
-                  Reopen Worker
-                </Button>
-              ))
-          : null}
         {plan?.criticBlocked ? (
           <Button size="sm" variant="outline" disabled={pending} onClick={onResetBlock}>
             Reset block
@@ -290,6 +273,7 @@ function ManualHarnessView({
                     {node.phase} · {node.execution} · {node.status}
                     {` · ${formatChoice(routingChoiceForPlanNode(plan?.nodes ?? [], node, status.routing))}`}
                     {node.result?.verdict ? ` · ${node.result.verdict}` : ""}
+                    {node.attempt ? ` · ${node.attempt.outcome}` : ""}
                     {node.attempt?.durationMs != null ? ` · ${node.attempt.durationMs}ms` : ""}
                     {node.attempt?.tokens.total != null ? ` · ${node.attempt.tokens.total} tok` : ""}
                   </p>
@@ -303,46 +287,78 @@ function ManualHarnessView({
                     </p>
                   ) : !nodeSpawnsChild(node) ? (
                     <p className="mt-1 text-[11px] text-muted-foreground">
-                      Stays on the parent thread
+                      {node.status === "pending"
+                        ? "Stays on the parent thread — click Start to run in this thread"
+                        : node.status === "in_progress" && !node.attempt
+                          ? "Starting in this thread…"
+                          : node.status === "in_progress" && node.attempt?.outcome === "running"
+                            ? "Running in this thread — waiting for agent response…"
+                            : node.status === "in_progress" && node.attempt?.outcome === "idle_with_output"
+                              ? "Output captured — review the response above, then mark Done"
+                              : node.status === "in_progress" && node.attempt?.outcome === "idle_empty"
+                                ? "No output was produced — retry or stop"
+                                : node.attempt
+                                  ? `Parent attempt ${node.attempt.outcome}`
+                                  : "Stays on the parent thread"}
                     </p>
                   ) : null}
-                  {node.status === "pending" || node.status === "in_progress" || node.status === "starting" ? (
-                    <div className="mt-2">
-                      <SlotModelPicker
-                        choice={persistedPlanChoice(node)}
-                        disabled={pending}
-                        onChange={(next) => onSetRouting(node.id, next)}
-                      />
-                    </div>
-                  ) : null}
-                  {node.phase === "critic" && node.status === "in_progress" ? (
+                  {(() => {
+                    const override = persistedPlanChoice(node);
+                    const effective = routingChoiceForPlanNode(plan?.nodes ?? [], node, status.routing);
+                    const editable = node.status === "pending";
+                    const locked = node.status !== "pending";
+                    return (
+                      <div className="mt-2">
+                        <NodeRoutingControl
+                          effective={effective}
+                          override={override}
+                          editable={editable}
+                          disabled={pending}
+                          onChange={(next) => onSetRouting(node.id, next)}
+                        />
+                        {locked && override ? (
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            Locked to node override {override.providerId}/{override.model} ({override.reasoningLevel}).
+                          </p>
+                        ) : null}
+                      </div>
+                    );
+                  })()}
+                  {node.status === "in_progress" && nodeSpawnsChild(node) ? (
                     <div className="mt-2 space-y-2">
                       <textarea
-                        value={criticSummary}
-                        onChange={(event) => setCriticSummary(event.target.value)}
-                        placeholder="Critic summary"
-                        aria-label="Critic summary"
+                        value={completionSummaries[node.id] ?? ""}
+                        onChange={(event) =>
+                          setCompletionSummaries((current) => ({
+                            ...current,
+                            [node.id]: event.target.value,
+                          }))
+                        }
+                        placeholder={`${PHASE_COPY[node.phase].label} completion summary`}
+                        aria-label={`${PHASE_COPY[node.phase].label} completion summary`}
                         rows={2}
                         className="flex w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm"
                       />
-                      <div className="flex flex-wrap gap-1">
-                        {CRITIC_VERDICTS.map((verdict) => (
-                          <Button
-                            key={verdict}
-                            size="sm"
-                            variant={verdict === "BLOCK" ? "destructive" : "outline"}
-                            disabled={pending || criticSummary.trim() === ""}
-                            onClick={() =>
-                              onCompleteNode(node.id, {
-                                verdict,
-                                summary: criticSummary.trim(),
-                              })
-                            }
-                          >
-                            {verdict}
-                          </Button>
-                        ))}
-                      </div>
+                      {node.phase === "critic" ? (
+                        <div className="flex flex-wrap gap-1">
+                          {CRITIC_VERDICTS.map((verdict) => (
+                            <Button
+                              key={verdict}
+                              size="sm"
+                              variant={verdict === "BLOCK" ? "destructive" : "outline"}
+                              disabled={pending || !(completionSummaries[node.id] ?? "").trim()}
+                              onClick={() =>
+                                onCompleteNode(node.id, {
+                                  verdict,
+                                  summary: (completionSummaries[node.id] ?? "").trim(),
+                                })
+                              }
+                            >
+                              {verdict}
+                            </Button>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -356,8 +372,20 @@ function ManualHarnessView({
                     <Button
                       size="sm"
                       variant="outline"
-                      disabled={pending}
-                      onClick={() => onCompleteNode(node.id)}
+                      disabled={
+                        pending ||
+                        (nodeSpawnsChild(node)
+                          ? !(completionSummaries[node.id] ?? "").trim()
+                          : node.attempt?.outcome !== "idle_with_output")
+                      }
+                      onClick={() => {
+                        const summary = (completionSummaries[node.id] ?? "").trim();
+                        if (nodeSpawnsChild(node)) {
+                          onCompleteNode(node.id, summary ? { summary } : undefined);
+                        } else {
+                          onCompleteNode(node.id, summary ? { summary } : undefined);
+                        }
+                      }}
                     >
                       Done
                     </Button>
@@ -409,35 +437,19 @@ export function HarnessPanel({
   const ctx = useBbContext();
   const threadId = threadIdProp ?? ctx.threadId;
   const projectId = ctx.projectId;
-  const { rpc, status, error, pending, run, refetch } = useHarness(threadId, projectId);
+  const { rpc, status, error, pending, run } = useHarness(threadId, projectId);
   const manual = Boolean(status?.harness);
-
-  const startForm = (
-    <StartHarnessForm
-      pending={pending}
-      customHarnesses={status?.customHarnesses ?? []}
-      onRefresh={refetch}
-      onStart={(input) => {
-        void run(() =>
-          rpc.call("startRun", {
-            threadId: threadId!,
-            projectId: projectId ?? undefined,
-            ...input,
-          }),
-        );
-      }}
-    />
-  );
 
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto box-border w-full max-w-3xl px-4 pb-6 pt-3 md:px-5 md:pt-4">
         <p className="text-sm text-muted-foreground">
-          Ordinary chats stay ordinary until you start a Harness. Then isolate
-          Explore, Plan, Worker, Critic, and Promote — one node at a time.
-          Standard Harness is the default. Auditable output lives in{" "}
-          <code>artifacts/</code>.
+          Ordinary chats stay ordinary until you start a Harness. New runs
+          are always v3 — Planner-led, with an explicit implementation DAG.
+          Auditable output lives in <code>artifacts/</code>.
         </p>
+
+        <HarnessV3Panel threadId={threadId} />
 
         {!threadId ? (
           <div className="mt-4 rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">
@@ -447,33 +459,32 @@ export function HarnessPanel({
           <div className="mt-4 rounded-lg border border-dashed border-border px-4 py-6 text-center text-sm text-muted-foreground">
             Loading harness…
           </div>
-        ) : (
-          <>
-            {manual ? (
-              <ManualHarnessView
+        ) : manual ? (
+          <section aria-label="Legacy run">
+            <h2 className="mt-6 text-sm font-medium">Legacy run (v0.1/v2)</h2>
+            <p className="mt-1 text-[12px] text-muted-foreground">
+              Read-only compatibility for a run started before v3. Finish or
+              stop it here; new work starts above as v3.
+            </p>
+            <ManualHarnessView
                 status={status}
                 pending={pending}
-                onAdvance={() => {
-                  void run(() =>
-                    rpc.call("advance", {
-                      threadId,
-                      projectId: projectId ?? undefined,
-                    }),
-                  );
-                }}
-                onRewind={() => {
-                  void run(() =>
-                    rpc.call("rewind", {
-                      threadId,
-                      projectId: projectId ?? undefined,
-                    }),
-                  );
-                }}
                 onStop={() => {
+                  if (!status.plan) return;
+                  const active = status.plan.nodes.find(
+                    (node) => node.status === "starting" || node.status === "in_progress",
+                  );
+                  const detail = active
+                    ? ` Active ${PHASE_COPY[active.phase].label} node “${active.title}” and its child will be interrupted.`
+                    : "";
+                  if (!window.confirm(`Cancel Harness “${status.plan.name}”?${detail}`)) return;
                   void run(() =>
                     rpc.call("stopRun", {
                       threadId,
                       projectId: projectId ?? undefined,
+                      expectedRevision: status.plan!.revision,
+                      requestId: mutationRequestId(),
+                      reason: "Operator confirmed cancellation from Harness panel.",
                     }),
                   );
                 }}
@@ -485,31 +496,28 @@ export function HarnessPanel({
                       nodeId,
                       threadId,
                       projectId: projectId ?? undefined,
+                      expectedRevision: status.plan!.revision,
+                      requestId: mutationRequestId(),
                     }),
                   );
                 }}
                 onCompleteNode={(nodeId, extra) => {
                   if (!status.plan) return;
-                  void run(() =>
-                    rpc.call("completeNode", {
-                      planId: status.plan!.id,
-                      nodeId,
-                      threadId,
-                      projectId: projectId ?? undefined,
-                      ...extra,
-                    }),
-                  );
-                }}
-                onReopenWorker={(nodeId) => {
-                  if (!status.plan) return;
-                  void run(() =>
-                    rpc.call("reopenNode", {
-                      planId: status.plan!.id,
-                      nodeId,
-                      threadId,
-                      projectId: projectId ?? undefined,
-                    }),
-                  );
+                  const node = status.plan.nodes.find((item) => item.id === nodeId);
+                  const base: Record<string, unknown> = {
+                    planId: status.plan!.id,
+                    nodeId,
+                    threadId,
+                    projectId: projectId ?? undefined,
+                    expectedRevision: status.plan!.revision,
+                    expectedAttemptId: node?.attempt?.id ?? null,
+                    requestId: mutationRequestId(),
+                  };
+                  if ((extra as Record<string, unknown> | undefined)?.summary !== undefined) base.summary = (extra as Record<string, unknown>).summary;
+                  if ((extra as Record<string, unknown> | undefined)?.verdict !== undefined) base.verdict = (extra as Record<string, unknown>).verdict;
+                  if ((extra as Record<string, unknown> | undefined)?.artifactPaths !== undefined) base.artifactPaths = (extra as Record<string, unknown>).artifactPaths;
+                  const payload = base;
+                  void run(() => rpc.call("completeNode", payload as never));
                 }}
                 onAddWorker={(title) => {
                   if (!status.plan) return;
@@ -524,6 +532,8 @@ export function HarnessPanel({
                       deps: last ? [last.id] : planNode ? [planNode.id] : [],
                       threadId,
                       projectId: projectId ?? undefined,
+                      expectedRevision: status.plan!.revision,
+                      requestId: mutationRequestId(),
                     }),
                   );
                 }}
@@ -536,6 +546,8 @@ export function HarnessPanel({
                       choice,
                       threadId,
                       projectId: projectId ?? undefined,
+                      expectedRevision: status.plan!.revision,
+                      requestId: mutationRequestId(),
                     }),
                   );
                 }}
@@ -546,22 +558,15 @@ export function HarnessPanel({
                       planId: status.plan!.id,
                       threadId,
                       projectId: projectId ?? undefined,
+                      expectedRevision: status.plan!.revision,
+                      requestId: mutationRequestId(),
+                      reason: "Operator reset Critic block from Harness panel.",
                     }),
                   );
                 }}
               />
-            ) : (
-              <div className="mt-4 rounded-lg border border-dashed border-border px-4 py-5">
-                <p className="text-sm font-medium">Harness is inactive</p>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  Starting requires an explicit task. No arc, banner, or role
-                  child is created until you start.
-                </p>
-                {startForm}
-              </div>
-            )}
-          </>
-        )}
+            </section>
+        ) : null}
 
         {error ? (
           <p role="alert" className="mt-3 text-sm text-destructive">
@@ -582,10 +587,36 @@ export function HarnessBanner({
   const threadId = threadIdProp ?? ctx.threadId;
   const projectId = ctx.projectId;
   const { status } = useHarness(threadId, projectId);
+  const rpc = useRpc();
+  const [v3State, setV3State] = useState<string | null>(null);
+  const refetchV3 = useCallback(() => {
+    if (!threadId) {
+      setV3State(null);
+      return;
+    }
+    (rpc.call as (m: string, i: unknown) => Promise<unknown>)(
+      "v3Status",
+      projectId ? { threadId, projectId } : { threadId },
+    ).then(
+      (result) => setV3State((result as { run: { state: string } | null }).run?.state ?? null),
+      () => setV3State(null),
+    );
+  }, [rpc, threadId, projectId]);
+  useEffect(() => {
+    refetchV3();
+  }, [refetchV3]);
+  useRealtime("harness", refetchV3);
+  if (v3State) {
+    return (
+      <p className="px-1 text-xs text-muted-foreground">
+        Harness · {v3State}
+      </p>
+    );
+  }
   if (status?.harness) {
     return (
       <p className="px-1 text-xs text-muted-foreground">
-        Harness · {PHASE_COPY[status.arc.phase].label}
+        Harness · {PHASE_COPY[status.arc.phase].label} (legacy)
       </p>
     );
   }

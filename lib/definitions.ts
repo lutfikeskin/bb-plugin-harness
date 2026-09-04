@@ -79,7 +79,7 @@ export function standardHarnessDefinition(now = 0): HarnessDefinition {
     id: STANDARD_HARNESS_ID,
     name: "Standard Harness",
     description:
-      "Explore → Plan → Worker → Critic → Promote. Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn visible children. Critic may rewind Worker. Promote communicates.",
+      "Explore → Plan → Worker → Critic → Promote. Explore and Plan stay on the parent thread. Worker, Critic, and Promote spawn visible children. Critic records APPROVE, structured REWORK, or BLOCK. Promote communicates.",
     kind: "builtin",
     engine: "manual",
     schemaVersion: HARNESS_SCHEMA_VERSION,

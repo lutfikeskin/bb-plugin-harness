@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { useState } from "react";
 import {
   loadPluginApp,
@@ -30,6 +30,26 @@ const emptyStatus = (threadId = "thr_1"): HarnessStatusDto => ({
   routing: emptyRoleRouting(),
   harness: null,
   customHarnesses: [],
+});
+
+const inactiveV3 = () => ({
+  run: null,
+  nodes: [],
+  nextNode: null,
+  doneCount: 0,
+  totalCount: 0,
+  stateCopy: { title: "Harness is inactive", body: "Ordinary chat.", primary: "Start Harness" },
+  skillWarnings: [],
+  providerWarnings: [],
+  decisions: [],
+  artifacts: [],
+  evaluation: null,
+  currentReviewApproved: false,
+  promotionSkipped: false,
+  failedRoles: [],
+  exportWarnings: [],
+  nextNodeRouting: null,
+  latestReports: { exploration: null, worker: [], critic: null, promotion: null },
 });
 
 function activeStatus(): HarnessStatusDto {
@@ -62,12 +82,15 @@ function activeStatus(): HarnessStatusDto {
       harnessId: STANDARD_HARNESS_ID,
       correctionCount: 0,
       criticBlocked: false,
+      lifecycle: "active",
+      revision: 0,
       harnessSnapshot: null,
       totals: {
         durationMs: 12,
         tokens: { input: 3, cached: 0, output: 1, reasoning: 0, total: 4 },
       },
       skillWarnings: [],
+      mutations: [],
       nodes: ["explore", "plan", "worker", "critic", "promote"].map((phase, index) => ({
         id: `${planId}-${phase}`,
         title: phase,
@@ -83,6 +106,7 @@ function activeStatus(): HarnessStatusDto {
         serviceTier: null,
         execution: phase === "explore" || phase === "plan" ? "parent" : "child",
         skills: [],
+        revision: 0,
         child: null,
         result: null,
         attempt: null,
@@ -96,6 +120,7 @@ beforeAll(async () => {
   app = await loadPluginApp(() => import("../app"));
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   cleanup();
 });
 
@@ -107,50 +132,62 @@ describe("Harness UI activation", () => {
     expect(app.composerCustomizations[0]?.banners?.[0]?.id).toBe("arc");
   });
 
-  it("renders an inactive Start Harness CTA without starting a run", async () => {
+  it("renders only the v3 start surface on an ordinary thread (no legacy start)", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
         rpc: {
           getStatus: () => emptyStatus(),
+          v3Status: () => inactiveV3(),
+          v3PresetList: () => ({ presets: [] }),
         },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
-    expect(await slot.findByText("Harness is inactive")).toBeTruthy();
-    const start = slot.getByRole("button", { name: "Start Harness" });
+    expect(await slot.findByText("Harness v3 (article-aligned arc)")).toBeTruthy();
+    const start = slot.getByRole("button", { name: "Start v3 Harness" });
     expect((start as HTMLButtonElement).disabled).toBe(true);
-    expect(slot.inspection.rpcCalls.every((call) => call.method === "getStatus")).toBe(true);
+    // No legacy start surface: no legacy CTA, no legacy start calls.
+    expect(slot.queryByRole("button", { name: "Start Harness" })).toBeNull();
+    expect(slot.queryByText("Harness is inactive")).toBeNull();
+    expect(slot.queryByText("Legacy run")).toBeNull();
+    expect(slot.inspection.rpcCalls.every((call) => call.method === "getStatus" || call.method === "v3Status" || call.method === "v3PresetList")).toBe(true);
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "startRun" || call.method === "v3Start")).toBe(false);
     slot.lifecycle.unmount();
   });
 
-  it("starts Standard Harness by default without Milestone fields", async () => {
+  it("starts v3 Harness from the single start surface", async () => {
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
         rpc: {
           getStatus: () => emptyStatus(),
-          startRun: () => emptyStatus(),
+          v3Status: () => inactiveV3(),
+          v3PresetList: () => ({ presets: [] }),
+          v3Start: () => ({}),
         },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
-    await slot.findByText("Harness is inactive");
-    expect(slot.queryByLabelText("Run Scout")).toBeNull();
+    await slot.findByText("Harness v3 (article-aligned arc)");
     expect(slot.queryByText("Milestone")).toBeNull();
-    fireEvent.change(slot.getByLabelText("Task"), {
-      target: { value: "Ship Standard Harness" },
-    });
-    fireEvent.click(slot.getByRole("button", { name: "Start Harness" }));
+    // Let both status and preset fetches settle so the button node is stable.
     await waitFor(() => {
-      expect(slot.inspection.rpcCalls.some((call) => call.method === "startRun")).toBe(true);
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "v3PresetList")).toBe(true);
     });
-    expect(slot.inspection.rpcCalls.find((call) => call.method === "startRun")?.input).toMatchObject({
-      harnessId: STANDARD_HARNESS_ID,
-      objective: "Ship Standard Harness",
+    fireEvent.change(slot.getByLabelText("Task"), {
+      target: { value: "Ship v3 Harness" },
     });
+    fireEvent.click(slot.getByRole("button", { name: "Start v3 Harness" }));
+    await waitFor(() => {
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "v3Start")).toBe(true);
+    });
+    expect(slot.inspection.rpcCalls.find((call) => call.method === "v3Start")?.input).toMatchObject({
+      objective: "Ship v3 Harness",
+    });
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "startRun")).toBe(false);
     slot.lifecycle.unmount();
   });
 
@@ -194,9 +231,10 @@ describe("Harness UI activation", () => {
       },
     );
     expect(await slot.findByText("Explore")).toBeTruthy();
+    // v3 preset editor shares the Critic name with legacy routing; both render.
     expect(slot.getByText("Plan")).toBeTruthy();
     expect(slot.getByText("Worker (first node)")).toBeTruthy();
-    expect(slot.getByText("Critic")).toBeTruthy();
+    expect(slot.getAllByText("Critic").length).toBeGreaterThanOrEqual(2);
     expect(slot.queryByText("Explore / Scout")).toBeNull();
     slot.lifecycle.unmount();
   });
@@ -206,12 +244,16 @@ describe("Harness UI activation", () => {
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
-        rpc: { getStatus: () => emptyStatus() },
+        rpc: {
+          getStatus: () => emptyStatus(),
+          v3Status: () => inactiveV3(),
+          v3PresetList: () => ({ presets: [] }),
+        },
         context: { projectId: "proj_1", threadId: "thr_1" },
         realtimeConnectionState: "reconnecting",
       },
     );
-    await slot.findByText("Harness is inactive");
+    await slot.findByText("Harness v3 (article-aligned arc)");
     const before = slot.inspection.rpcCalls.filter((call) => call.method === "getStatus").length;
     await slot.behavior.setRealtimeConnectionState("connected");
     await waitFor(() => {
@@ -259,69 +301,34 @@ describe("Harness UI activation", () => {
     slot.lifecycle.unmount();
   });
 
-  it("creates a custom Harness from Standard", async () => {
+  it("requires state-aware confirmation and revision provenance before Stop", async () => {
+    const confirm = vi.spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
     const slot = renderSlot(
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
         rpc: {
-          getStatus: () => emptyStatus(),
-          createHarness: (input: { name: string }) => ({
-            harness: {
-              id: "c-careful-aaaaaaaa",
-              name: input.name,
-              description: "custom",
-              kind: "custom",
-              engine: "manual",
-              schemaVersion: 2 as const,
-              artifactPolicy: "advisory" as const,
-              promoteMode: "always" as const,
-              maxCorrections: null,
-              phases: {
-                explore: { title: "e", detail: "d", execution: "parent" as const, skills: [] },
-                plan: { title: "p", detail: "d", execution: "parent" as const, skills: [] },
-                worker: { title: "w", detail: "d", execution: "child" as const, skills: [] },
-                critic: { title: "c", detail: "d", execution: "child" as const, skills: [] },
-                promote: { title: "pr", detail: "d", execution: "child" as const, skills: [] },
-              },
-              createdAt: 1,
-              updatedAt: 1,
-            },
-          }),
+          getStatus: () => activeStatus(),
+          stopRun: () => emptyStatus(),
         },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
-    await slot.findByText("Create Harness");
-    fireEvent.click(slot.getByRole("button", { name: "Create Harness" }));
-    fireEvent.change(slot.getByLabelText("Harness name"), {
-      target: { value: "Careful ship" },
-    });
-    fireEvent.click(slot.getByRole("button", { name: "Save Harness" }));
+    const stop = await slot.findByRole("button", { name: "Stop" });
+    fireEvent.click(stop);
+    expect(slot.inspection.rpcCalls.some((call) => call.method === "stopRun")).toBe(false);
+    fireEvent.click(stop);
     await waitFor(() => {
-      expect(slot.inspection.rpcCalls.some((call) => call.method === "createHarness")).toBe(true);
+      expect(slot.inspection.rpcCalls.some((call) => call.method === "stopRun")).toBe(true);
     });
-    slot.lifecycle.unmount();
-  });
-
-  it("surfaces custom Harness mutation errors", async () => {
-    const slot = renderSlot(
-      app.threadPanelActions[0]!,
-      { threadId: "thr_1", params: null },
-      {
-        rpc: {
-          getStatus: () => emptyStatus(),
-          createHarness: () => {
-            throw new Error("At most 32 custom Harnesses can be saved.");
-          },
-        },
-        context: { projectId: "proj_1", threadId: "thr_1" },
-      },
-    );
-    await slot.findByText("Create Harness");
-    fireEvent.click(slot.getByRole("button", { name: "Create Harness" }));
-    fireEvent.click(slot.getByRole("button", { name: "Save Harness" }));
-    expect((await slot.findByRole("alert")).textContent).toMatch(/at most 32/i);
+    expect(confirm.mock.calls[0]?.[0]).toMatch(/active Explore node/i);
+    expect(slot.inspection.rpcCalls.find((call) => call.method === "stopRun")?.input).toMatchObject({
+      expectedRevision: 0,
+      reason: expect.stringMatching(/confirmed cancellation/i),
+    });
+    confirm.mockRestore();
     slot.lifecycle.unmount();
   });
 
@@ -330,19 +337,42 @@ describe("Harness UI activation", () => {
       app.threadPanelActions[0]!,
       { threadId: "thr_1", params: null },
       {
-        rpc: { getStatus: () => activeStatus() },
+        rpc: {
+          getStatus: () => activeStatus(),
+          v3Status: () => inactiveV3(),
+          v3PresetList: () => ({ presets: [] }),
+        },
         context: { projectId: "proj_1", threadId: "thr_1" },
       },
     );
-    expect(await slot.findByRole("button", { name: "Advance" })).toBeTruthy();
-    expect(slot.getByRole("button", { name: "Rewind" })).toBeTruthy();
-    expect(slot.getByRole("button", { name: "Stop" })).toBeTruthy();
+    expect(await slot.findByRole("button", { name: "Stop" })).toBeTruthy();
+    expect(slot.queryByRole("button", { name: "Advance" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Rewind" })).toBeNull();
+    expect(slot.queryByRole("button", { name: "Reopen Worker" })).toBeNull();
     expect(slot.getByRole("button", { name: "Done" })).toBeTruthy();
     expect(slot.getAllByRole("button", { name: "Start" }).length).toBeGreaterThan(0);
     expect(slot.getByRole("button", { name: "Add Worker" })).toBeTruthy();
     expect(slot.getByText(/tokens 4/)).toBeTruthy();
+    expect(slot.getByText("Legacy run (v0.1/v2)")).toBeTruthy();
     expect(slot.queryByText("Harness is inactive")).toBeNull();
     expect(slot.queryByText("Current stage:")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows the v3 banner state for an active v3 run", async () => {
+    const banner = app.composerCustomizations[0]!.banners![0]!;
+    const slot = renderSlot(
+      { component: banner.component },
+      {},
+      {
+        rpc: {
+          getStatus: () => emptyStatus(),
+          v3Status: () => ({ run: { state: "Executing" } }),
+        },
+        context: { projectId: "proj_1", threadId: "thr_1" },
+      },
+    );
+    expect(await slot.findByText("Harness · Executing")).toBeTruthy();
     slot.lifecycle.unmount();
   });
 });

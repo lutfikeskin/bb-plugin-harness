@@ -94,6 +94,17 @@ export function emptyRoleRouting(): RoleRouting {
   };
 }
 
+export function defaultRoleRouting(): RoleRouting {
+  return {
+    explore: { providerId: "acp-devin", model: "swe-1-7-medium", reasoningLevel: "medium" },
+    plan: { providerId: "pi", model: "openai-codex/gpt-5.6-sol", reasoningLevel: "high" },
+    workerFirst: { providerId: "pi", model: "opencode/muse-spark-1.3-contributor-free", reasoningLevel: "high" },
+    workerRest: { providerId: "pi", model: "opencode/muse-spark-1.3-contributor-free", reasoningLevel: "high" },
+    critic: { providerId: "pi", model: "openai-codex/gpt-5.6-sol", reasoningLevel: "high" },
+    promote: { providerId: "acp-cursor", model: "grok-4.6", reasoningLevel: "high" },
+  };
+}
+
 export function routingSlotFor(phase: Phase, workerIndex: number): RoutingSlot {
   if (phase === "worker") return workerIndex <= 0 ? "workerFirst" : "workerRest";
   if (phase === "explore" || phase === "plan" || phase === "critic" || phase === "promote") {
@@ -254,6 +265,7 @@ export type PlanNode = {
   serviceTier?: string | null;
   execution?: ExecutionMode;
   skills?: string[];
+  revision?: number;
 };
 
 export function nodeChoice(node: PlanNode): ExecutionChoice | null {

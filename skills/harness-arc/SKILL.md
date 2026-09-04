@@ -1,63 +1,62 @@
 ---
 name: harness-arc
-description: Drive work through the Harness plugin's Explore → Plan → Worker → Critic → Promote arc and its one-node-at-a-time DAG. Use when the user mentions the harness, Standard Harness, custom Harnesses, prewalk, DAG plans, artifacts/ discipline, Critic APPROVE/REWORK/BLOCK, or asks to advance, rewind, or plan the current thread.
+description: Drive work through Harness for BB — Planner-led arc, explicit implementation DAG, operator gates. Use when the user mentions Harness, DAG plans, task packets, role presets, Critic APPROVE/REWORK/BLOCK, or asks to run or inspect the current Harness.
 ---
 
-# Harness arc
+# Harness for BB (v3 Harness Arc)
 
-The Harness plugin is the fulcrum between expectations and the model. Roles stay isolated. A prompt that plans, implements, and critiques itself confuses its own objectives.
+Harness is an opt-in BB orchestration mode for complex work. BB remains the harness: project/environment, instructions, skills, providers, child threads, scripts. The plugin adds role routing, context packets, gates, DAG state, and recovery.
 
-Ordinary chats stay ordinary until the operator explicitly starts a Harness.
+Use it for branchy, risky, creative, or multi-step work. For trivial edits, ordinary BB chat is the correct path — the inactive panel says so.
 
-## Standard Harness (default)
+## The arc
 
-1. **Explore** — map the problem. Do not implement yet. Stays on the parent thread.
-2. **Plan** — freeze an explicit DAG. Stays on the parent thread.
-3. **Worker** — implement one node. Spawns a child thread.
-4. **Critic** — simplify and push back. Complete with APPROVE, REWORK, or BLOCK. Spawns a child thread.
-5. **Promote** — the job is unfinished until you communicate it. Spawns a child thread.
+Setup → Exploring → Planning → PlanApproval → Executing ⇄ WorkerReview → Critiquing → FinalReview → (Promoting) → Complete. Blocked/Cancelled branch with explicit recovery. The DAG holds implementation tasks only (worker role); there are no explore/plan/critic/promote phase nodes.
 
-Custom Harnesses clone this five-arc shape. Name, description, per-phase instructions, parent/child execution, artifact policy, promote mode (`always` or `off`), and max corrections can change. Starting snapshots the resolved definition into the plan so later edits do not rewrite in-flight work. This plugin injects only `harness-arc`; it cannot attach arbitrary BB skills.
+Planner is the durable orchestrator in a dedicated visible thread (panel embeds it via `ThreadChat`). Explorer, Workers, Critic, and optional Promoter get isolated role threads with distinct prompts and model routing.
 
-Milestone Pipeline is removed. Do not start `--milestone` or `milestone-pipeline`.
+## Gates (human authority)
 
-## Commands
+Plan approval, Worker accept/changes, Critic APPROVE/REWORK/BLOCK, rework scope, promotion start/skip, cancellation, completion. Children cannot approve themselves, start unrelated nodes, mutate routing, or complete the run.
+
+## Commands (v3)
 
 | Command | Effect |
 | --- | --- |
-| `bb harness status` | Current phase, resolved model, next DAG node |
-| `bb harness start --task "<text>"` | Start Standard Harness |
-| `bb harness start --task "<text>" --harness <id>` | Start a named Harness |
-| `bb harness advance` | Move one phase forward |
-| `bb harness rewind` | Move one phase back (critic → worker) |
-| `bb harness set-phase <phase>` | Jump to explore\|plan\|worker\|critic\|promote |
-| `bb harness init` | Create `artifacts/`, `plans/`, and `HARNESS.md` |
-| `bb harness plan create "<name>"` | Seed a five-node DAG (add `--no-seed` for empty) |
-| `bb harness plan list` / `show <id>` | List or inspect a plan |
-| `bb harness plan next <id>` | Next unblocked node |
-| `bb harness plan start <id> <node>` | Start a node (spawns a child when execution is child) |
-| `bb harness plan complete <id> <node> [--verdict APPROVE\|REWORK\|BLOCK] [--summary "<text>"]` | Mark that node done |
-| `bb harness plan add <id> <title> [--phase worker] [--deps a,b]` | Add a node |
+| `bb harness status` | Show v3 run (or legacy arc when no v3 run exists) |
+| `bb harness start --task "<text>" [--preset <id>]` | Start v3 (new starts always use v3) |
+| `bb harness approve-plan` | Snapshot the Planner draft as revision 1 and start execution |
+| `bb harness review-worker <node-id> --approve\|--changes "<text>"` | Accept a Worker node or return it to ready |
+| `bb harness review-critic --approve\|--rework <ids> --reason "<text>"\|--block "<text>"` | Operator Critic decision; REWORK invalidates selected + downstream |
+| `bb harness promote --start\|--skip` | Optional communication (off/ask/always per preset) |
+| `bb harness cancel --reason "<text>"` | Stop all role children first, then cancel |
+| `bb harness export` | List artifacts + manifest |
+| `bb harness preset list\|show\|create\|update\|delete` | Saved role presets (First Worker / Later Workers split) |
+| `bb harness legacy list\|show\|cancel` | Read-only legacy v0.1/v2 runs |
 
-Pass `--thread <id>` when you are not already inside that thread. Add `--json` when the output drives code.
+Pass `--thread <id>` outside a thread and `--json` for machine-readable output.
 
-Native tools: `harness_get_arc`, `harness_advance`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`.
+Legacy `plan ...`, `routing`, `set-phase`, `stop` remain read-compatible for one release and never mutate v3 state.
+
+## Native tools (gated to the exact live attempt)
+
+Planner: `harness_get_run_context` (full packet), `harness_run_explorer` (dispatches Explorer; its report is delivered back agent-only on submit), `harness_submit_plan_draft`, `harness_update_plan_draft`. Worker: `harness_get_node_context` (role packet slice), `harness_submit_worker_report` (one report per attempt). Critic: `harness_get_review_context` (objective, plan, all Worker reports, verification), `harness_submit_critic_report` (recommends only). Explorer: `harness_submit_exploration` (stored and delivered to Planner). Promoter: `harness_get_promotion_context`, `harness_submit_promotion`. Superseded threads (after retry/accept/new spawn) and repeat submits from the same attempt are rejected.
+
+Legacy tools (`harness_get_arc`, `harness_create_plan`, `harness_next_node`, `harness_complete_node`) remain for legacy runs only.
 
 ## Procedure
 
-1. `bb harness status` (or `harness_get_arc`) before changing anything.
-2. Stay in the current phase. If you need a DAG, advance to Plan and write a DAG instead of improvising a giant todo list in prose.
-3. Worker: start the next node, finish it, complete it, then take the following node. Never start two nodes.
-4. Keep auditable outputs in `artifacts/`. Do not dump scratch into the repo root.
-5. After Worker, advance to Critic. Complete Critic with APPROVE, REWORK, or BLOCK. REWORK reopens Worker after stopping the live Critic child.
-6. Promote last: tell the people who need to know. BLOCK prevents Promote until the operator resets it.
+1. Read `bb harness status`.
+2. Work only the current gate and role.
+3. Store evidence under `artifacts/harness/<run-id>/` (task-packet.json, exploration.md, plan.md with Mermaid, nodes/\<id\>/worker-report.md, critic.md, promotion.md, manifest.json). DB state stays authoritative.
+4. Refresh after reconnects, failures, stops, or stale-revision errors. Every mutation carries expected run revision + request ID; repeated request IDs replay current state without re-applying.
+5. Recover explicitly: retry/stop role, cancel after children stop, resume after reload from DB, reconcile idle/failed/deleted children, repair stale providers.
 
-## Role routing
+## Routing, skills, verification, and honest limits
 
-Settings → Role routing picks a real provider and model for Explore/Plan (parent on Standard), Worker, Critic, and Promote.
-
-A DAG node can override that slot. Unset means inherit the parent thread's provider/model when BB exposes `defaultExecutionOptions`. Otherwise attempt telemetry records `inherited-unknown` with null provider/model. No cost is invented.
-
-Do not auto-complete a node when the child goes idle. The operator clicks Done or records a Critic verdict.
-
-Plugin RPC is full-trust local UI/CLI. It is not a tenant auth boundary. Plan mutations require the owning parent thread.
+- Saved Role Presets (Settings → Role presets) route Explorer/Planner/First Worker/Later Workers/Critic/Promoter with per-role permission and promotion/artifact policy; fresh installs inherit. The previous routing migrates once to "Migrated role routing". Snapshots freeze at Start; pending-node overrides lock after claim. Source labels: preset, node override, inherited.
+- Accepting the final Worker moves straight to Critiquing. After Critic approval the panel offers Start Promoter / Skip communication; Mark complete appears only after approval — and, once promotion starts, only after the promotion report lands.
+- First Worker / Later Workers approximates model specialization with fresh contexts. It is not a true context-preserving prewalk; "Prewalk" is exposed only after live proof of safe same-session switching.
+- `skillHints` are validated against BB discovery and delivered as requested capabilities. The SDK can only select this plugin's own skills (`harness-planner`, `harness-worker`, `harness-critic`, `harness-promoter`); cross-plugin skill activation cannot be forced or treated as a security boundary.
+- Planner records per-node verification commands; Workers run them via normal agent tools; Critic reruns the cheapest checks. No shell execution is smuggled into the server plugin.
+- Provider availability is validated at Start; stale models block Start with a repair control. Token totals count distinct role threads only (deltas where available); missing values are "unavailable". No money is estimated without authoritative pricing.
